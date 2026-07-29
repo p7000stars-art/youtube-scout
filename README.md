@@ -33,6 +33,16 @@ npx github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
 
 산출물은 `./out/<영상ID>/`에 생긴다. 구간별 `seg-SSSS-EEEE.md`와 병합본 `_merged.md`.
 
+> **Windows에서 `npx`가 막힐 때** — PowerShell 기본 실행 정책(Restricted)이
+> `npx.ps1` 로드를 차단하는 경우가 있다 (`UnauthorizedAccess` 오류, 실측 2026-07-30).
+> 정책을 바꿀 필요 없이 `.cmd` 심을 명시하면 된다:
+>
+> ```powershell
+> npx.cmd github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
+> ```
+>
+> cmd(명령 프롬프트)에서는 `npx` 그대로 동작한다.
+
 ### 배치
 
 ```bash
