@@ -16,32 +16,56 @@
 
 ## 5분 시작
 
+준비물은 두 가지다 — **Node 20 이상**과 **Gemini API 키**.
+
 ```bash
-# 1) Node 20 이상이 필요하다
-node --version
+node --version   # v20 이상이면 통과. 없으면 https://nodejs.org 에서 LTS 설치
+```
 
-# 2) 키 발급 — https://aistudio.google.com/apikey
+키는 https://aistudio.google.com/apikey 에서 무료로 발급한다 (카드 등록 불요).
+발급했으면 아래에서 **자기 환경 하나만** 따라 하면 된다.
 
-# 3) 환경변수 설정
-export GEMINI_API_KEY="발급받은키"        # macOS / Linux
-$env:GEMINI_API_KEY="발급받은키"          # Windows PowerShell
-setx GEMINI_API_KEY "발급받은키"          # Windows 영구 설정 (새 터미널부터 적용)
+### Windows — cmd (명령 프롬프트)
 
-# 4) 실행
+```bat
+:: 1) 키 등록 (최초 한 번)
+setx GEMINI_API_KEY "발급받은키"
+
+:: 2) 창을 닫고 새 cmd를 연다
+::    ⚠️ setx는 지금 열려 있는 창에는 적용되지 않는다 — 여기서 가장 많이 막힌다
+
+:: 3) 실행
 npx github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
 ```
 
-산출물은 `./out/<영상ID>/`에 생긴다. 구간별 `seg-SSSS-EEEE.md`와 병합본 `_merged.md`.
+### Windows — PowerShell
 
-> **Windows에서 `npx`가 막힐 때** — PowerShell 기본 실행 정책(Restricted)이
-> `npx.ps1` 로드를 차단하는 경우가 있다 (`UnauthorizedAccess` 오류, 실측 2026-07-30).
-> 정책을 바꿀 필요 없이 `.cmd` 심을 명시하면 된다:
->
-> ```powershell
-> npx.cmd github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
-> ```
->
-> cmd(명령 프롬프트)에서는 `npx` 그대로 동작한다.
+```powershell
+# 1) 키 등록 (최초 한 번, 새 창부터 적용)
+setx GEMINI_API_KEY "발급받은키"
+
+# 지금 창에서 바로 쓰려면 이것도 함께:
+$env:GEMINI_API_KEY="발급받은키"
+
+# 2) 실행 — npx가 아니라 npx.cmd 다
+npx.cmd github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
+```
+
+> PowerShell에서 `npx`를 그대로 치면 기본 실행 정책(Restricted)이 `npx.ps1` 로드를 차단해
+> `UnauthorizedAccess` 오류가 난다 (실측 2026-07-30). 정책을 바꿀 필요 없이 `.cmd`만 붙이면 된다.
+
+### macOS / Linux
+
+```bash
+export GEMINI_API_KEY="발급받은키"   # 영구 설정은 ~/.zshrc 등에 추가
+npx github:p7000stars-art/youtube-scout "https://www.youtube.com/watch?v=..."
+```
+
+### 결과
+
+첫 실행은 npx가 저장소를 내려받느라 수십 초 더 걸린다. 이후에는 캐시로 바로 뜬다.
+산출물은 실행한 위치의 `./out/<영상ID>/`에 생긴다 — 구간별 `seg-SSSS-EEEE.md`와
+병합본 `_merged.md`. **병합본부터 열면 된다.**
 
 ### 배치
 
