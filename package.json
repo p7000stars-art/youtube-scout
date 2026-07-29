@@ -1,0 +1,36 @@
+{
+  "name": "youtube-scout",
+  "version": "0.1.0",
+  "description": "유튜브 영상의 화면 정보까지 회수해 구조화된 보고서를 내는 정찰병 CLI",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "youtube-scout": "./bin/youtube-scout.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check-leak": "node scripts/check-leak.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/p7000stars-art/youtube-scout.git"
+  },
+  "keywords": [
+    "youtube",
+    "gemini",
+    "cli",
+    "transcript",
+    "scout"
+  ],
+  "files": [
+    "bin/",
+    "src/",
+    "prompt/",
+    "docs/",
+    "LICENSE",
+    "README.md"
+  ]
+}

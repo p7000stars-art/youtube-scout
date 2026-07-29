@@ -141,3 +141,15 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# ── youtube-scout ────────────────────────────────────────────────
+# 산출물. 추출본에는 영상 내용이 통째로 들어가므로 절대 커밋하지 않는다.
+out/
+
+# 개인 유출 패턴 목록. 검사기 자체가 유출원이 되지 않도록 저장소 밖에 둔다.
+# (scripts/check-leak.js 7장 주의사항 참조)
+.check-leak.local
+
+# API 키가 담길 수 있는 파일. 위 dotenv 섹션과 중복이지만 의도를 명시해 둔다.
+.env
+.env.local
