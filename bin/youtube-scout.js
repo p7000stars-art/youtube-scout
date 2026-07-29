@@ -33,6 +33,8 @@ import {
 } from '../src/quota.js';
 import { segFileName, segDocument, harnessName, today } from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
+import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
+import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
@@ -44,6 +46,7 @@ const USAGE = `
 youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰병
 
 사용법:
+  youtube-scout init                더블클릭 실행 환경 생성 (반복 사용자의 본선)
   youtube-scout <url...>            링크를 인자로 (단건·소수)
   youtube-scout --file links.txt    파일로 (배치. # 주석·빈 줄 허용)
 
@@ -187,6 +190,72 @@ async function runChunk(p) {
   }
 }
 
+// ── init 서브커맨드 ────────────────────────────────────────────────
+/**
+ * 더블클릭 실행 환경을 만든다.
+ *
+ * 키가 없어도 동작해야 한다 — init은 "아직 아무것도 없는 사람"이 부르는 명령이고,
+ * 키 등록 안내가 생성물 안에 들어 있는 것이 이 기능의 핵심이다. 그래서 키 검사보다 앞에서
+ * 처리한다.
+ *
+ * @param {{ chunk: number, fallbackModels: string[] }} p
+ */
+async function runInit(p) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  // MODELS 초기값을 하드코딩하지 않는다. 모델 세대교체가 빨라서, 박아 두면
+  // 몇 달 뒤 생성된 run 파일이 존재하지 않는 모델을 가리킨다.
+  let models = p.fallbackModels;
+  let discovered = false;
+
+  if (apiKey) {
+    show('가용 모델 조회 중...');
+    const available = await fetchAvailableModels(apiKey);
+    if (available) {
+      models = available;
+      discovered = true;
+    }
+  }
+
+  const r = await initRunDir({ cwd: process.cwd(), models, chunk: p.chunk });
+
+  show('');
+  show(`실행 환경: ${r.dir}`);
+  for (const name of r.created) show(`  + ${name}`);
+  for (const name of r.skipped) show(`  = ${name} (이미 있어서 건드리지 않았다)`);
+
+  show('');
+  if (discovered) {
+    show(`  모델 ${models.length}개를 지금 조회해 넣었다: ${models.join(', ')}`);
+    show('  앞에 있는 모델이 먼저 쓰인다. 순서는 run 파일 상단에서 바꿀 수 있다.');
+  } else {
+    show(`  모델은 기본값 하나로 넣었다: ${models.join(', ')}`);
+    if (apiKey) {
+      show('  (모델 목록 조회에 실패했다. 네트워크가 되는 곳에서 init을 다시 실행하면');
+      show('   그때 가용한 모델로 채워진다)');
+    } else {
+      show('  (GEMINI_API_KEY가 없어 조회를 건너뛰었다. 키를 등록한 뒤 init을 다시 실행하면');
+      show('   그때 가용한 모델로 채워진다 — 기존 파일은 건드리지 않으므로');
+      show(`   ${RUN_BAT_NAME}을 지우고 다시 실행해야 갱신된다)`);
+    }
+  }
+
+  show('');
+  show('다음 할 일:');
+  show(`  1. ${LINKS_NAME} 에 유튜브 링크를 한 줄에 하나씩 적는다`);
+  show(`  2. Windows: ${RUN_BAT_NAME} 더블클릭 / macOS·Linux: ./${RUN_SH_NAME}`);
+  if (!r.chmodOk) {
+    // Windows에서 init한 경우. links.txt에도 같은 안내가 들어 있다.
+    show(`     (macOS·Linux에서는 처음 한 번 chmod +x ${RUN_SH_NAME} 이 필요하다)`);
+  }
+  if (!process.env.GEMINI_API_KEY) {
+    show(`  3. 키 등록 — ${LINKS_NAME} 상단 안내 참조 (등록 후 새 창을 열어야 적용된다)`);
+  }
+  show('');
+
+  return 0;
+}
+
 // ── 영상 하나 처리 ──────────────────────────────────────────────────
 /**
  * @param {{
@@ -316,6 +385,23 @@ async function main() {
     return values.help ? 0 : 2;
   }
 
+  const chunk = Number(values.chunk);
+  if (!Number.isFinite(chunk) || chunk <= DEFAULT_OVERLAP_SEC) {
+    show(`--chunk 값이 유효하지 않다: ${values.chunk} (겹침 ${DEFAULT_OVERLAP_SEC}초보다 커야 한다)`);
+    return 2;
+  }
+
+  // 0) init 서브커맨드. 키 검사보다 앞이다 — 키 등록 안내를 담은 파일을 만드는 것이
+  //    이 명령의 목적이라, 키가 없다고 막으면 필요한 사람이 쓸 수 없다.
+  if (positionals[0] === 'init') {
+    if (positionals.length > 1) {
+      show(`init 은 추가 인자를 받지 않는다: ${positionals.slice(1).join(' ')}`);
+      show(`(생성 위치는 항상 현재 폴더의 ${RUN_DIR_NAME}/ 이다)`);
+      return 2;
+    }
+    return runInit({ chunk, fallbackModels: String(values.models).split(',').map((m) => m.trim()).filter(Boolean) });
+  }
+
   // 1) 키 확인. 인자로는 절대 받지 않는다 — 셸 히스토리와 프로세스 목록에 남는다.
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -327,12 +413,6 @@ async function main() {
     show('');
     show('  키는 CLI 인자로 받지 않는다 (셸 히스토리 유출 차단).');
     return 1;
-  }
-
-  const chunk = Number(values.chunk);
-  if (!Number.isFinite(chunk) || chunk <= DEFAULT_OVERLAP_SEC) {
-    show(`--chunk 값이 유효하지 않다: ${values.chunk} (겹침 ${DEFAULT_OVERLAP_SEC}초보다 커야 한다)`);
-    return 2;
   }
 
   // 2) 하네스 로딩. 코드에 하드코딩하지 않는 이유는 이것이 교체·검증 가능해야 하기 때문이다.
