@@ -1,0 +1,233 @@
+// @ts-check
+/**
+ * 더블클릭 실행 환경 생성. `youtube-scout init`이 부르는 코어다.
+ *
+ * ## 왜 이 기능이 있는가
+ * 반복 사용자의 본선은 "터미널을 열고 링크를 인자로 넘기기"가 아니다. 링크를 파일에 모아 두고
+ * 실행 파일을 더블클릭하는 것이다. 그 환경을 손으로 만들게 하면 매번 경로와 옵션을 틀린다.
+ *
+ * ## 절대 규칙
+ * 생성 파일에 API 키를 쓰지 않는다. 키 입력란도, placeholder도 만들지 않는다.
+ * 파일에 키를 적을 자리를 만들어 두면 사용자가 거기에 키를 적고, 그 파일이 공유·백업된다.
+ * 키는 환경변수로만 받는다는 규칙이 생성물에서도 그대로 유지돼야 한다.
+ */
+
+import { writeFile, mkdir, chmod, access } from 'node:fs/promises';
+import { join } from 'node:path';
+
+export const RUN_DIR_NAME = 'youtube-scout-run';
+export const RUN_BAT_NAME = 'run.bat';
+export const RUN_SH_NAME = 'run.sh';
+export const LINKS_NAME = 'links.txt';
+
+/** npx로 부를 저장소. 생성 파일 3종이 같은 값을 쓰도록 한곳에 둔다. */
+const PKG = 'github:p7000stars-art/youtube-scout';
+
+/**
+ * run.bat 본문. **ASCII 전용 + CRLF.**
+ *
+ * ## 왜 .bat에 한글을 한 글자도 넣지 않는가 (실측 2026-07-30)
+ * .bat의 한글은 콘솔 코드페이지(cp949)로 기록돼야 하는데, 런타임 의존성 0 원칙상
+ * Node 내장 기능만으로는 cp949 인코딩을 만들 수 없다. UTF-8로 한글을 쓴 .bat은
+ * conhost가 글자를 두 번 그리는 실사건이 있었다(깨진 안내문은 안내문이 아니다).
+ * 그래서 이 파일의 안내는 전부 영어다. 한국어 안내는 links.txt가 담당한다.
+ *
+ * ## 왜 CRLF인가
+ * cmd 파서는 LF 단독 개행에서 라벨·블록 처리가 불안정하다. .bat은 CRLF가 정본이다.
+ *
+ * @param {{ chunk: number, models: string[] }} p
+ * @returns {string} CRLF로 끝나는 ASCII 문자열
+ */
+export function buildRunBat({ chunk, models }) {
+  const lines = [
+    '@echo off',
+    'rem ===== settings (edit here) =====',
+    `set CHUNK=${chunk}`,
+    `set MODELS=${models.join(',')}`,
+    'rem ================================',
+    'rem MODELS is a priority list. The first model is used first.',
+    'rem Models appended by auto-discovery sit at the tail because they are',
+    'rem not verified for small-text reading. Promote one by moving it left.',
+    '',
+    'rem Parenthesized if-blocks in .bat break on any ) inside echoed text,',
+    'rem so this uses a goto instead.',
+    'if not "%GEMINI_API_KEY%"=="" goto run',
+    '',
+    'echo.',
+    'echo [!] GEMINI_API_KEY is not set.',
+    'echo.',
+    'echo     1. Get a free key here:',
+    'echo        https://aistudio.google.com/apikey',
+    'echo.',
+    'echo     2. Register it once:',
+    'echo.',
+    'echo        setx GEMINI_API_KEY "your-key-here"',
+    'echo.',
+    'echo     3. Close this window and open a NEW window.',
+    'echo        setx does NOT affect windows that are already open.',
+    'echo        This is where most people get stuck.',
+    'echo.',
+    'echo     Then run this file again.',
+    'echo.',
+    'pause',
+    'exit /b 1',
+    '',
+    ':run',
+    'rem %~dp0 is this file folder, so the whole folder can be moved freely.',
+    `call npx ${PKG} --file "%~dp0${LINKS_NAME}" -o "%~dp0out" --chunk %CHUNK% --models %MODELS%`,
+    '',
+    'rem npx is npx.cmd. Without "call" above, this .bat would end there and',
+    'rem never reach the pause below, so the window would vanish.',
+    'echo.',
+    'echo Done. Output is in the "out" folder next to this file.',
+    'echo Open _merged.md first.',
+    'pause',
+    '',
+  ];
+
+  const text = `${lines.join('\r\n')}`;
+
+  // 안전망. 나중에 누가 한글 안내를 넣으면 여기서 즉시 터진다 (조용히 깨진 .bat보다 낫다).
+  const bad = [...text].find((ch) => ch.codePointAt(0) > 0x7f);
+  if (bad) {
+    throw new Error(`run.bat에 non-ASCII 문자가 있다: ${JSON.stringify(bad)}`);
+  }
+  return text;
+}
+
+/**
+ * run.sh 본문. UTF-8(BOM 없음) + LF. 여기는 한글 주석을 써도 안전하다.
+ * @param {{ chunk: number, models: string[] }} p
+ */
+export function buildRunSh({ chunk, models }) {
+  return [
+    '#!/usr/bin/env bash',
+    '# ===== 설정 (여기만 고치면 된다) =====',
+    `CHUNK=${chunk}`,
+    `MODELS="${models.join(',')}"`,
+    '# ====================================',
+    '# MODELS는 우선순위 목록이다. 앞에 있는 모델이 먼저 쓰인다.',
+    '# 자동 발견으로 편입된 모델은 작은 글자 판독력이 미검증이라 꼬리에 있다.',
+    '# 써 보고 좋았으면 이름을 왼쪽으로 옮겨 승격하면 된다.',
+    '',
+    'set -u',
+    '',
+    '# 스크립트 위치 기준 경로. 폴더째 옮겨도 동작한다.',
+    'DIR="$(cd "$(dirname "$0")" && pwd)"',
+    '',
+    'if [ -z "${GEMINI_API_KEY:-}" ]; then',
+    '  echo',
+    '  echo "[!] GEMINI_API_KEY 환경변수가 없다."',
+    '  echo',
+    '  echo "    1. 키 발급: https://aistudio.google.com/apikey"',
+    '  echo "    2. 등록:"',
+    '  echo',
+    '  echo "         export GEMINI_API_KEY=\\"발급받은키\\""',
+    '  echo',
+    '  echo "    영구 설정은 ~/.zshrc 나 ~/.bashrc 에 위 줄을 추가한다."',
+    '  echo',
+    '  exit 1',
+    'fi',
+    '',
+    `npx ${PKG} --file "$DIR/${LINKS_NAME}" -o "$DIR/out" --chunk "$CHUNK" --models "$MODELS"`,
+    '',
+    'echo',
+    'echo "끝났다. 산출물은 이 파일 옆 out 폴더에 있다. _merged.md 부터 열면 된다."',
+    '',
+  ].join('\n');
+}
+
+/**
+ * links.txt 본문. UTF-8(BOM 없음) + LF.
+ * .bat이 영어만 쓸 수 있으므로 한국어 안내는 전부 이 파일이 진다.
+ */
+export function buildLinksTxt() {
+  return [
+    '# 여기에 유튜브 링크를 한 줄에 하나씩 적는다.',
+    '# 이 줄처럼 #으로 시작하는 줄과 빈 줄은 무시된다.',
+    '#',
+    '# ── 실행 ────────────────────────────────────────────────',
+    '#   Windows      : run.bat 을 더블클릭',
+    '#   macOS/Linux  : 터미널에서 ./run.sh',
+    '#                  처음 한 번은 실행 권한이 필요하다 →  chmod +x run.sh',
+    '#',
+    '# ── 키 등록 (최초 한 번) ────────────────────────────────',
+    '#   Windows      : setx GEMINI_API_KEY "발급받은키"',
+    '#                  ⚠️ 등록 후 창을 닫고 새 창을 열어야 적용된다.',
+    '#                     여기서 가장 많이 막힌다.',
+    '#   macOS/Linux  : export GEMINI_API_KEY="발급받은키"',
+    '#   키 발급       : https://aistudio.google.com/apikey (무료, 카드 등록 불요)',
+    '#',
+    '#   키는 이 파일이나 run 파일에 적지 않는다. 환경변수로만 쓴다.',
+    '#',
+    '# ── 청크·모델 바꾸기 ────────────────────────────────────',
+    '#   run.bat / run.sh 맨 위의 CHUNK, MODELS 값을 고친다.',
+    '#   CHUNK 를 키우면 요청 수가 줄어든다 (기본 480초).',
+    '#   MODELS 는 우선순위 목록이다. 앞에 있는 모델이 먼저 쓰인다.',
+    '#',
+    '# ── 알아 둘 것 ──────────────────────────────────────────',
+    '#   공개 영상만 처리된다 (회원 전용·비공개는 건너뛴다).',
+    '#   중간에 끊겨도 다시 실행하면 완료된 구간을 건너뛰고 이어서 한다.',
+    '#   산출물은 미검증이다. 명령어·URL·경로 같은 긴 문자열은 공식 소스와 대조할 것.',
+    '',
+    '# 예시 (이 줄의 # 을 지우고 자기 링크로 바꿔도 된다)',
+    '# https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    '',
+  ].join('\n');
+}
+
+/**
+ * 실행 환경을 생성한다.
+ *
+ * 기존 파일은 절대 덮어쓰지 않는다 — links.txt에는 사용자가 모아 둔 링크가 들어 있고,
+ * run 파일에는 사용자가 승격한 모델 순서가 들어 있다. 덮어쓰면 둘 다 파괴된다.
+ * 그래서 init은 몇 번 실행해도 안전한 연산이어야 한다.
+ *
+ * @param {{ cwd: string, models: string[], chunk: number }} p
+ * @returns {Promise<{
+ *   dir: string,
+ *   created: string[],
+ *   skipped: string[],
+ *   chmodOk: boolean
+ * }>}
+ */
+export async function initRunDir({ cwd, models, chunk }) {
+  const dir = join(cwd, RUN_DIR_NAME);
+  await mkdir(dir, { recursive: true });
+
+  const files = [
+    { name: RUN_BAT_NAME, body: buildRunBat({ chunk, models }) },
+    { name: RUN_SH_NAME, body: buildRunSh({ chunk, models }) },
+    { name: LINKS_NAME, body: buildLinksTxt() },
+  ];
+
+  /** @type {string[]} */
+  const created = [];
+  /** @type {string[]} */
+  const skipped = [];
+
+  for (const f of files) {
+    const path = join(dir, f.name);
+    try {
+      await access(path);
+      skipped.push(f.name); // 이미 있다 → 손대지 않는다
+      continue;
+    } catch {
+      // 없으니 생성한다
+    }
+    // BOM을 붙이지 않는다. .bat의 BOM은 첫 줄을 깨뜨리고, .sh의 BOM은 shebang을 깨뜨린다.
+    await writeFile(path, f.body, 'utf8');
+    created.push(f.name);
+  }
+
+  // Windows에서 init하면 실패한다. 그래서 links.txt에 chmod 안내를 넣어 뒀다.
+  let chmodOk = false;
+  try {
+    await chmod(join(dir, RUN_SH_NAME), 0o755);
+    chmodOk = true;
+  } catch {
+    chmodOk = false;
+  }
+
+  return { dir, created, skipped, chmodOk };
+}
