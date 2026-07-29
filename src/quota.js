@@ -113,13 +113,16 @@ export class ModelPool {
     this.models = list;
     /** RPD 소진 모델. 이번 실행 동안만 유효하다(내일이면 풀린다). @type {Set<string>} */
     this.exhausted = new Set();
+    /** 퇴역(404) 모델. 내일도 안 된다 — RPD와 구분해 안내해야 한다 (실측 2026-07-30:
+     *  /models 목록의 gemini-2.5-flash가 generateContent 404. 좀비 모델). @type {Set<string>} */
+    this.dead = new Set();
     /** 영상 단위 순환 커서 */
     this.cursor = 0;
   }
 
   /** 아직 쓸 수 있는 모델 목록 */
   available() {
-    return this.models.filter((m) => !this.exhausted.has(m));
+    return this.models.filter((m) => !this.exhausted.has(m) && !this.dead.has(m));
   }
 
   /** 전 모델이 RPD로 소진됐는가 (→ 잔여 영상은 이월) */
@@ -149,6 +152,18 @@ export class ModelPool {
    */
   markExhausted(model) {
     this.exhausted.add(model);
+    return this.assign();
+  }
+
+  /**
+   * 퇴역(404) 처리 후 대체 모델을 돌려준다.
+   * RPD(markExhausted)와 동작은 같지만 사후 안내가 다르다 —
+   * RPD는 "내일 재실행"이 해법이고, 퇴역은 목록에서 제거하는 것이 해법이다.
+   * @param {string} model
+   * @returns {string|null}
+   */
+  markDead(model) {
+    this.dead.add(model);
     return this.assign();
   }
 }

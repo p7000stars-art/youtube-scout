@@ -179,7 +179,7 @@ async function runChunk(p) {
         // 이 키에서는 영구 실패이므로 재시도가 무의미하다 → RPD와 동일하게 즉시 교체.
         // 404는 쿼터를 소모하지 않으므로 좀비가 몇 개든 각 1회 헛손질로 끝난다.
         log(`      404 — 모델 '${model}'은(는) 목록에는 있으나 실사용이 불가하다 (퇴역 추정). 제외한다.`);
-        const next = p.pool.markExhausted(model);
+        const next = p.pool.markDead(model);
         if (!next) return { ok: false, daily: false, reason: '404 (사용 가능한 모델 없음)', model };
         log(`      모델 교체: ${model} → ${next}`);
         model = next;
@@ -588,6 +588,10 @@ async function main() {
   show('─'.repeat(60));
   if (pool.exhausted.size) {
     show(`  일일 한도 소진 모델: ${[...pool.exhausted].join(', ')} (내일 재실행하면 이어서 처리된다)`);
+  }
+  if (pool.dead.size) {
+    // 퇴역은 RPD와 해법이 다르다 — 내일도 안 된다. run 파일/--models에서 빼는 게 답이다.
+    show(`  퇴역(404) 모델: ${[...pool.dead].join(', ')} — 내일도 사용 불가. --models 또는 run 파일에서 제거를 권장한다`);
   }
   show(`  산출물: ${outDir}`);
   show(`  로그:   ${logPath}`);

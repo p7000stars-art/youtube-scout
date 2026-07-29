@@ -120,6 +120,25 @@ test('ModelPool: 빈 목록은 거부', () => {
   assert.throws(() => new ModelPool(['', '  ']));
 });
 
+test('ModelPool: 퇴역(404)은 RPD와 별도 집합으로 구분된다', () => {
+  // 실측 2026-07-30: /models 목록의 gemini-2.5-flash가 generateContent 404 (좀비 모델).
+  // RPD는 내일 풀리지만 퇴역은 내일도 안 된다 — 사후 안내가 달라야 하므로 집합을 분리한다.
+  const pool = new ModelPool(['zombie-flash', 'alive-flash']);
+  const next = pool.markDead('zombie-flash');
+  assert.equal(next, 'alive-flash', '퇴역 즉시 대체 모델을 배정한다');
+  assert.deepEqual([...pool.dead], ['zombie-flash']);
+  assert.deepEqual([...pool.exhausted], [], 'RPD 집합에는 섞이지 않는다');
+  assert.deepEqual(pool.available(), ['alive-flash']);
+});
+
+test('ModelPool: 퇴역+RPD가 겹쳐 전 모델이 빠지면 배정이 null이다', () => {
+  const pool = new ModelPool(['zombie-flash', 'busy-flash']);
+  pool.markDead('zombie-flash');
+  const next = pool.markExhausted('busy-flash');
+  assert.equal(next, null);
+  assert.ok(pool.allExhausted());
+});
+
 test('기본 상수는 실측치', () => {
   assert.equal(MAX_RETRIES, 3);
   assert.equal(CALL_INTERVAL_MS, 6_000);
