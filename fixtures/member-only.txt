@@ -1,0 +1,4 @@
+# 회귀 테스트 픽스처 — playabilityStatus 사전 차단 검증용. 삭제 금지.
+# 아래는 회원 전용 공개 영상이다. meta.js가 playable=false + 사유를 반환해야 하고,
+# 러너는 API를 0회 호출하고 건너뛰어야 한다.
+https://www.youtube.com/watch?v=UUFDMG1wpcY

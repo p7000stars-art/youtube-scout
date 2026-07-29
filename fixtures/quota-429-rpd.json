@@ -1,0 +1,24 @@
+{
+  "error": {
+    "code": 429,
+    "message": "You exceeded your current quota, please check your plan and billing details.",
+    "status": "RESOURCE_EXHAUSTED",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        "violations": [
+          {
+            "quotaMetric": "generativelanguage.googleapis.com/generate_requests_per_model_per_day",
+            "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+            "quotaDimensions": { "model": "gemini-3.6-flash", "location": "global" },
+            "quotaValue": "20"
+          }
+        ]
+      },
+      {
+        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+        "retryDelay": "57s"
+      }
+    ]
+  }
+}
