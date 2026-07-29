@@ -430,3 +430,110 @@ https://www.youtube.com/watch?v=UUFDMG1wpcY
 7. `_merged.md`에 frontmatter·미검증 배너·(실패 시) ⛔가 정확히 들어간다
 8. 저장소 전체에 `MEDIA_RESOLUTION_LOW` 문자열이 존재하지 않는다
 9. 모든 소스 파일에 한글 주석이 있고, 실측 근거 로직에는 근거가 병기돼 있다
+
+
+---
+
+# 2차 기능 추가 지시 (2026-07-30 확정) — init 서브커맨드 + 모델 자동 발견
+
+> 1~13장은 구현·검증 완료(PR #1 머지). 아래 14~16장이 신규 작업이다.
+> 기존 규칙(1장)은 전부 그대로 적용된다. 특히: 키를 파일에 절대 쓰지 않는다.
+
+## 14. `src/models.js` — 모델 목록 조회·대조
+
+- `GET https://generativelanguage.googleapis.com/v1beta/models` (헤더 `x-goog-api-key`)
+  이 엔드포인트는 generateContent 쿼터(RPD)를 소모하지 않는다 — 부팅 시 1회 호출해도 안전
+- 응답의 `models[]`에서 **가용 후보** 필터 (전부 만족해야 함):
+  1. `supportedGenerationMethods`에 `generateContent` 포함
+  2. 모델명에 `flash` 포함 (무료 티어 휴리스틱 — Pro 계열은 2026-04부터 유료 전용)
+  3. 모델명에 `embedding`·`tts`·`image`·`audio`·`live` 미포함 (용도 다름)
+  4. `name`의 `models/` 접두는 벗겨서 비교·사용
+- 내보낼 함수 2개:
+  - `fetchAvailableModels(apiKey)` → 가용 후보 문자열 배열. 네트워크 실패 시 예외가 아니라
+    `null` 반환 (조회 실패가 본 작업을 막으면 안 된다)
+  - `reconcilePool(userPool, available)` → `{ pool, removed, appended }`
+    - available이 null이면 userPool 그대로 (대조 생략)
+    - userPool 중 available에 없는 모델 → 제외하고 removed에 기록
+    - available 중 userPool에 없는 모델 → **pool의 맨 뒤에** 순서대로 편입, appended에 기록
+- **왜 꼬리 편입인가 (주석 필수)**: 새 모델은 작은 글자 판독력이 미검증이다. 저해상도 실측에서
+  나쁜 조건의 모델은 못 읽는다고 신고하는 게 아니라 그럴듯하게 채우고 "판독불가 없음"이라
+  선언했다 — 나쁘면 티가 안 난다. 검증 풀이 소진됐을 때만 받게 꼬리에 둔다.
+  또한 실측상 신형·프리뷰일수록 쿼터를 더 조인다. 좋았으면 사용자가 run 파일에서 앞으로
+  승격한다(그것이 검증 게이트다).
+
+## 15. `init` 서브커맨드 — 더블클릭 실행 환경 생성
+
+`youtube-scout init` → 현재 폴더(cwd)에 `youtube-scout-run/` 생성:
+`run.bat`(Windows) + `run.sh`(macOS/Linux) + `links.txt`. 둘 다 항상 생성한다.
+
+### 공통 규칙
+- **이미 존재하는 파일은 절대 덮어쓰지 않는다** — 건너뛰고 알린다
+  (links.txt에는 사용자의 링크가 들어 있다. 덮어쓰면 데이터 파괴)
+- MODELS 초기값: 키가 있으면 `fetchAvailableModels`로 **init 시점 실시간 생성**
+  (하드코딩 금지 — 모델 세대교체가 빠르다). 키가 없거나 조회 실패면 `gemini-3.6-flash`
+  하나로 폴백하고, 키 설정 후 init 재실행을 안내
+- 키는 어떤 생성 파일에도 쓰지 않는다. 키 입력란·placeholder도 만들지 않는다
+
+### run.bat 명세 ⚠️ 인코딩 함정 (실측 2026-07-30)
+- **ASCII 전용 + CRLF(\r\n) 명시 기록.** 한글 한 글자도 넣지 않는다 —
+  .bat의 한글은 cp949를 요구하는데 의존성 0 원칙상 Node에서 cp949 인코딩 불가.
+  UTF-8 한글 .bat은 conhost가 글자를 두 번 그린다(실사건)
+- 구조 (의사코드):
+  ```
+  @echo off
+  rem ===== settings (edit here) =====
+  set CHUNK=480
+  set MODELS=<init 시점 생성 목록, 쉼표 구분>
+  rem ================================
+  if "%GEMINI_API_KEY%"=="" -> 영어로 setx 안내 + "open a NEW window" 경고 + pause + exit /b 1
+  call npx github:p7000stars-art/youtube-scout --file "%~dp0links.txt" -o "%~dp0out" --chunk %CHUNK% --models %MODELS%
+  pause
+  ```
+- `call` 필수 — npx는 npx.cmd라서 call 없이 부르면 bat이 거기서 종료돼 pause에 못 온다
+- `%~dp0` 사용 — 폴더째 옮겨도 동작. 더블클릭은 cmd 실행이라 PS 실행 정책 함정도 자동 회피
+- 마지막 pause는 결과 확인용 1회 정지다 (작업 대기가 아님 — 구 PS판 Read-Host와 다름)
+
+### run.sh 명세
+- UTF-8(BOM 없음) + LF. 한글 주석 허용. shebang `#!/usr/bin/env bash`
+- 같은 구조: 상단 CHUNK/MODELS 변수, 키 부재 시 export 안내 후 종료,
+  `"$(cd "$(dirname "$0")" && pwd)"` 기준 경로, npx 호출
+- 생성 후 실행 권한 부여 시도(chmod). Windows에서 init한 경우 불가하므로
+  links.txt 안내문에 `chmod +x run.sh` 1줄 포함
+
+### links.txt 명세
+- UTF-8(BOM 없음). 한글 주석으로 사용법 안내:
+  링크 한 줄에 하나 / # 주석·빈 줄 허용 / 모델·청크 수정은 run 파일 상단 /
+  키 등록법(setx + 새 창) / macOS는 chmod 안내
+
+## 16. 부팅 대조 (기존 실행 경로에 통합)
+
+일반 실행(bin)에서 메타 조회 전에 1회:
+1. `fetchAvailableModels` 호출 (실패 시 조용히 생략 — 대조는 보조 기능, 본 작업을 막지 않는다)
+2. `reconcilePool(사용자 모델 목록, 조회 결과)` 적용
+3. 콘솔 안내 (한글):
+   - removed: `! <모델> 은(는) 더 이상 제공되지 않아 제외합니다`
+   - appended: `i 새 모델 발견, 순환 꼬리에 편입: <모델> — 검증 풀 소진 시에만 사용됩니다`
+4. 신모델이 실제 사용된 seg·frontmatter에는 기존 각인 규칙이 그대로 적용된다 (추가 작업 없음)
+5. 계획표의 한도 추정치(`모델 N개 × 20회`)는 대조 후 최종 풀 기준으로 계산
+
+## 17. 테스트 추가 (node:test, 네트워크 없이)
+
+- `fixtures/models-list.json` 신설 — /v1beta/models 응답 형태 (flash 2종 + pro 1종 +
+  embedding 1종 + flash지만 generateContent 미지원 1종 포함)
+- `test/models.test.js`:
+  - 필터: 픽스처에서 가용 후보가 flash 2종만 나온다
+  - reconcile: 사라진 모델 제외 + removed 기록 / 새 모델 꼬리 편입 + appended 기록 /
+    available null이면 원본 유지
+- init 파일 생성 테스트: 임시 디렉터리에 생성 → run.bat이 ASCII 전용인지·CRLF인지 검사
+  (버퍼에 0x80 이상 바이트 없음 + \r\n 존재) / 기존 파일 미덮어쓰기 검증
+
+## 18. 완료 기준 추가분
+
+10. `youtube-scout init` 이 cwd에 run.bat + run.sh + links.txt를 생성하고,
+    재실행 시 기존 파일을 건드리지 않는다
+11. 생성된 run.bat에 non-ASCII 바이트가 없고 줄바꿈이 CRLF다
+12. 어떤 생성 파일에도 API 키·키 입력란이 없다
+13. 모델 대조: 목록에 없는 모델은 경고와 함께 제외되고, 새 모델은 꼬리에만 편입되며,
+    조회 실패 시 사용자 목록 그대로 진행된다
+14. README "5분 시작"에 init 경로를 추가하되 기존 npx 직접 실행 경로도 유지한다
+    (init 안내가 더 앞에 오게 — 반복 사용자의 본선이므로)
