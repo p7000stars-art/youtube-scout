@@ -180,7 +180,17 @@ test('안내 문구는 제외와 편입을 구분한다', () => {
   assert.equal(lines.length, 2);
   assert.match(lines[0], /더 이상 제공되지 않아 제외합니다/);
   assert.match(lines[1], /꼬리에 편입/);
-  assert.match(lines[1], /검증 풀 소진 시에만 사용됩니다/);
+  assert.match(lines[1], /검증 풀 소진 시에만 사용/);
+});
+
+test('편입이 여러 건이어도 안내는 한 줄로 접힌다 (제외 경고가 묻히지 않게)', () => {
+  const lines = reconcileMessages({
+    removed: ['old-flash'],
+    appended: ['a-flash', 'b-flash', 'c-flash'],
+  });
+  assert.equal(lines.length, 2, '제외 1줄 + 편입 요약 1줄');
+  assert.match(lines[1], /새 모델 3종/);
+  assert.match(lines[1], /a-flash, b-flash, c-flash/);
 });
 
 test('바뀐 것이 없으면 안내 문구도 없다', () => {

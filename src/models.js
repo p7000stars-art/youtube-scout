@@ -155,8 +155,13 @@ export function reconcileMessages(r) {
   for (const m of r.removed) {
     lines.push(`! ${m} 은(는) 더 이상 제공되지 않아 제외합니다`);
   }
-  for (const m of r.appended) {
-    lines.push(`i 새 모델 발견, 순환 꼬리에 편입: ${m} — 검증 풀 소진 시에만 사용됩니다`);
+  // 편입은 한 줄로 접는다 — 기본(1종) 풀로 실행하면 편입이 십수 줄씩 쏟아져
+  // 정작 중요한 제외(!) 경고가 묻힌다 (실측 2026-07-30: 14줄).
+  // 제외는 사용자가 지정한 것이 사라진 사건이라 건별 유지, 편입은 정보성이라 요약.
+  if (r.appended.length > 0) {
+    lines.push(
+      `i 새 모델 ${r.appended.length}종을 순환 꼬리에 편입 (검증 풀 소진 시에만 사용): ${r.appended.join(', ')}`,
+    );
   }
   return lines;
 }
