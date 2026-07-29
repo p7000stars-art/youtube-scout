@@ -453,12 +453,20 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   logPath = join(outDir, '_batch.log');
 
-  const models = String(values.models).split(',');
+  const requestedModels = String(values.models).split(',');
+
+  // 3-5) 부팅 대조 1회. `/v1beta/models`는 generateContent 쿼터를 쓰지 않으므로
+  //      본 작업의 예산을 깎지 않는다. 조회가 실패하면 조용히 생략한다 —
+  //      대조는 보조 기능이고, 이것 때문에 추출이 막히면 우선순위가 뒤집힌다.
+  const available = await fetchAvailableModels(apiKey);
+  const reconciled = reconcilePool(requestedModels, available);
+  for (const line of reconcileMessages(reconciled)) log(line);
+
   /** @type {ModelPool} */
   let pool;
   try {
-    pool = new ModelPool(models);
-  } catch (e) {
+    pool = new ModelPool(reconciled.pool);
+  } catch {
     show(`--models 값이 유효하지 않다: ${values.models}`);
     return 2;
   }
