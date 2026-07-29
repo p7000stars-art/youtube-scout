@@ -173,6 +173,19 @@ async function runChunk(p) {
         continue;
       }
 
+      if (e.status === 404) {
+        // 좀비 모델 (실측 2026-07-30): /v1beta/models 목록에는 있는데 generateContent가
+        // 404를 돌려주는 퇴역 모델이 존재한다 (gemini-2.5-flash — 텍스트 요청에도 404).
+        // 이 키에서는 영구 실패이므로 재시도가 무의미하다 → RPD와 동일하게 즉시 교체.
+        // 404는 쿼터를 소모하지 않으므로 좀비가 몇 개든 각 1회 헛손질로 끝난다.
+        log(`      404 — 모델 '${model}'은(는) 목록에는 있으나 실사용이 불가하다 (퇴역 추정). 제외한다.`);
+        const next = p.pool.markExhausted(model);
+        if (!next) return { ok: false, daily: false, reason: '404 (사용 가능한 모델 없음)', model };
+        log(`      모델 교체: ${model} → ${next}`);
+        model = next;
+        continue; // 교체는 재시도 횟수에 세지 않는다. 다른 모델의 첫 시도다.
+      }
+
       if (e.status === 403) {
         return { ok: false, daily: false, reason: forbiddenMessage(), model };
       }
