@@ -146,6 +146,9 @@ vite.config.ts.timestamp-*
 # 산출물. 추출본에는 영상 내용이 통째로 들어가므로 절대 커밋하지 않는다.
 out/
 
+# init 생성물. 저장소 안에서 init을 시험했을 때 사용자의 링크 목록이 딸려 올라가는 것을 막는다.
+youtube-scout-run/
+
 # 개인 유출 패턴 목록. 검사기 자체가 유출원이 되지 않도록 저장소 밖에 둔다.
 # (scripts/check-leak.js 7장 주의사항 참조)
 .check-leak.local
