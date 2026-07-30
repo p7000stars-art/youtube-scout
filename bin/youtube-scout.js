@@ -41,6 +41,7 @@ import {
   serializeStatus,
   pruneStale,
   recordFailure,
+  failureReason,
   applyStatus,
   statusMessages,
   promotionMessage,
@@ -211,15 +212,15 @@ async function writeStatusFile() {
  * 모델 제외 판정을 기록한다. **발생 즉시 파일까지 flush한다** — 실행이 중단돼도
  * 관찰이 남아야 하기 때문이다(구간 파일을 즉시 쓰는 것과 같은 이유).
  *
- * 청크 초를 사유에 박는 것은 여기서 한다. tpm 판정은 요청 크기에 달린 조건부 판정이라
- * "몇 초 청크에서 막혔는지"가 판정의 일부다. 청크 설정을 아는 층이 이 껍데기다.
+ * `sec`는 설정값(--chunk)이 아니라 **실패한 구간의 실제 초**다. 마지막 구간은 영상 끝에서
+ * 잘려 설정값보다 짧고, 그 차이가 다음 실행의 판정을 뒤집는다 (근거는 `failureReason` 주석).
  *
  * @param {string} model
  * @param {import('./chunk-runner.js').FailureKind} kind
- * @param {number} chunk
+ * @param {number} sec 실패한 구간의 실제 길이(초)
  */
-async function recordModelFailure(model, kind, chunk) {
-  const reason = kind === 'tpm' ? `tpm-${chunk}` : kind;
+async function recordModelFailure(model, kind, sec) {
+  const reason = failureReason(kind, sec);
   const r = recordFailure(statusEntries, { model, reason, date: today() });
   statusEntries = r.entries;
   if (r.promoted) {
@@ -431,7 +432,9 @@ async function runVideo(p) {
           shownModel = m;
         },
         // 제외 판정(404·RPD·구조적 TPM)을 상태 파일에 즉시 남긴다.
-        onFailure: (m, kind) => recordModelFailure(m, kind, p.chunk),
+        // 초는 runChunk가 준 실제 구간 길이를 그대로 쓴다 — 설정값(p.chunk)을 쓰면
+        // 짧은 꼬리 구간에서 막힌 것이 480초에서 막힌 것으로 기록된다.
+        onFailure: (m, kind, sec) => recordModelFailure(m, kind, sec),
       });
     } finally {
       activeSpinner = null;
