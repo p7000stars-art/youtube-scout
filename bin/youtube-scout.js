@@ -8,7 +8,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, mkdir, appendFile, access, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, appendFile, access, readdir, stat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -54,11 +54,14 @@ import {
 import {
   initRunDir,
   refreshRunModels,
+  refreshUpdateCheck,
   RUN_DIR_NAME,
   RUN_BAT_NAME,
   RUN_SH_NAME,
   LINKS_NAME,
+  UPDATE_CHECK_NAME,
 } from '../src/init.js';
+import { fetchLatestCommitMs, needsRefresh } from './update-check.js';
 import { spinner, bar, fmtSec } from './ui.js';
 import { runChunk } from './chunk-runner.js';
 
@@ -70,6 +73,18 @@ const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
  * src/가 저장소 구조를 알면 껍데기 교체 시 같이 깨진다. 그래서 껍데기가 읽어 인자로 넘긴다.
  */
 const PKG_PATH = resolve(HERE, '../package.json');
+
+/** init이 실행 폴더에 복사해 둘 업데이트 확인 스크립트. 원본은 하나이고 사본은 복사본이다. */
+const UPDATE_CHECK_PATH = resolve(HERE, 'update-check.js');
+
+/** @returns {Promise<string>} 읽지 못하면 빈 문자열 — 스크립트 없이도 나머지는 생성된다. */
+async function readUpdateCheckSource() {
+  try {
+    return await readFile(UPDATE_CHECK_PATH, 'utf8');
+  } catch {
+    return '';
+  }
+}
 
 /** @returns {Promise<string>} 읽지 못해도 실행을 막지 않는다 — 각인은 보조 정보다. */
 async function readScoutVersion() {
@@ -90,6 +105,8 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
   youtube-scout init                더블클릭 실행 환경 생성 (반복 사용자의 본선)
   youtube-scout init --refresh-models
                                     기존 run 파일의 MODELS 줄만 최신 목록으로 갱신
+  youtube-scout init --refresh-update-check
+                                    기존 실행 폴더에 업데이트 확인 장치를 보정
   youtube-scout <url...>            링크를 인자로 (단건·소수)
   youtube-scout --file links.txt    파일로 (배치. # 주석·빈 줄 허용)
 
@@ -104,6 +121,7 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
 
 환경변수:
   GEMINI_API_KEY        필수. 인자로는 받지 않는다 (셸 히스토리 유출 차단)
+  UPDATE_CHECK=0        업데이트 확인을 끈다 (오프라인 작업 등)
 
 파일:
   ${STATUS_FILE_NAME}      실행 폴더에 쌓이는 모델 실패 관찰. 뒤로 미룬 모델(demoted)과
@@ -234,6 +252,30 @@ function bootProgress(total) {
   };
 }
 
+/**
+ * 새 판이 나왔는지만 확인한다 (직접 실행 사용자용 알림).
+ *
+ * 설치 시각은 패키지 폴더의 mtime으로 본다 — npx 캐시든 전역 설치든 "이 사본이 언제
+ * 만들어졌나"가 그 값이다. 버전 문자열을 쓰지 않는 이유는 update-check.js와 같다:
+ * 버전은 CI가 올리는데 CI가 멈추면 감지까지 죽고, 커밋 시각은 저장소가 살아 있는 한 갱신된다.
+ *
+ * 실패는 전부 false다. 확인하지 못한 것과 최신인 것은 다른 사실이지만, 둘 다
+ * "아무 말도 하지 않는다"로 귀결되므로 구분할 이유가 없다.
+ *
+ * @returns {Promise<boolean>} 새 판이 확실히 있으면 true
+ */
+async function checkForUpdate() {
+  if (process.env.UPDATE_CHECK === '0') return false;
+  try {
+    const installedMs = (await stat(resolve(HERE, '..'))).mtimeMs;
+    const commitMs = await fetchLatestCommitMs();
+    if (commitMs == null) return false;
+    return needsRefresh({ installedMs, commitMs });
+  } catch {
+    return false;
+  }
+}
+
 // ── 모델 상태 파일 ──────────────────────────────────────────────────
 // 지난 실행들의 실패 관찰을 이어받는 곳. 판정·형식은 코어(src/model-status.js)가 하고
 // 여기서는 읽기·쓰기와 안내만 한다.
@@ -357,7 +399,12 @@ async function runInit(p) {
     }
   }
 
-  const r = await initRunDir({ cwd: process.cwd(), models, chunk: p.chunk });
+  const r = await initRunDir({
+    cwd: process.cwd(),
+    models,
+    chunk: p.chunk,
+    updateCheck: await readUpdateCheckSource(),
+  });
 
   show('');
   show(`실행 환경: ${r.dir}`);
@@ -380,6 +427,13 @@ async function runInit(p) {
       show('   youtube-scout init --refresh-models 를 실행하면 MODELS 줄만 갱신된다 —');
       show('   링크와 CHUNK 설정은 그대로 유지된다)');
     }
+  }
+
+  if (r.created.includes(UPDATE_CHECK_NAME)) {
+    show('');
+    show(`  ${UPDATE_CHECK_NAME}: 실행할 때마다 최신판을 자동으로 받는다.`);
+    show('  (npx는 처음 받은 판을 계속 재사용한다 — 이 스크립트가 그 캐시만 정확히 지운다)');
+    show('  끄려면 환경변수 UPDATE_CHECK=0 을 준다.');
   }
 
   show('');
@@ -447,6 +501,47 @@ async function runRefreshModels() {
   show('');
   show('  MODELS 줄만 바꿨다. CHUNK와 나머지 설정·주석은 그대로다.');
   show('  신형 세대가 앞, -latest 별칭이 뒤다. 순서를 바꾸고 싶으면 직접 편집하면 된다.');
+  show('');
+
+  return r.failed.length ? 1 : 0;
+}
+
+/**
+ * 기존 실행 폴더에 업데이트 확인 장치를 보정한다 (`init --refresh-update-check`).
+ *
+ * 이 판부터 생긴 장치라, 그전에 init을 돌린 사용자에게는 스크립트도 호출 줄도 없다.
+ * `initRunDir`이 기존 파일을 덮어쓰지 않으므로 재실행으로는 영원히 생기지 않는다.
+ */
+async function runRefreshUpdateCheck() {
+  const source = await readUpdateCheckSource();
+  if (!source) {
+    show(`${UPDATE_CHECK_NAME} 원본을 읽지 못했다. 설치가 손상됐을 수 있다.`);
+    return 1;
+  }
+
+  const r = await refreshUpdateCheck({ cwd: process.cwd(), updateCheck: source });
+
+  if (!r.dir) {
+    show(`실행 환경을 찾지 못했다 (${RUN_DIR_NAME}/${RUN_BAT_NAME} 또는 ${RUN_SH_NAME}).`);
+    show('  먼저 youtube-scout init 으로 실행 환경을 만들어라.');
+    return 1;
+  }
+
+  show('');
+  show(`실행 환경: ${r.dir}`);
+  if (r.createdScript) show(`  + ${UPDATE_CHECK_NAME}`);
+  else if (r.scriptExists) show(`  = ${UPDATE_CHECK_NAME} (이미 있어서 건드리지 않았다)`);
+  for (const name of r.wired) show(`  ~ ${name} — 업데이트 확인 호출을 npx 앞에 넣었다`);
+  for (const name of r.already) show(`  = ${name} (이미 호출이 있다)`);
+  for (const name of r.noAnchor) {
+    // 사용자가 구조를 바꾼 파일이다. 추측해서 줄을 넣으면 실행 순서가 뒤바뀔 수 있다.
+    show(`  ! ${name} 에서 npx 호출 줄을 찾지 못해 건너뛰었다 — 직접 넣어라:`);
+    show(`      npx 호출 바로 앞에  node "이 폴더/${UPDATE_CHECK_NAME}"`);
+  }
+  for (const f of r.failed) show(`  ! ${f.name} 보정 실패: ${f.error}`);
+
+  show('');
+  show('  이제 실행할 때마다 최신판을 자동으로 받는다. 끄려면 UPDATE_CHECK=0 을 준다.');
   show('');
 
   return r.failed.length ? 1 : 0;
@@ -653,6 +748,8 @@ async function main() {
         harness: { type: 'string' },
         // init 전용. 기존 실행 환경의 MODELS 줄만 갈아 끼운다 (사용자가 명시적으로 부를 때만)
         'refresh-models': { type: 'boolean', default: false },
+        // init 전용. 이 판부터 생긴 업데이트 확인 장치를 기존 실행 폴더에 보정한다
+        'refresh-update-check': { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
     });
@@ -687,12 +784,15 @@ async function main() {
     // 갱신은 생성과 다른 명령이다. 생성이 기존 파일을 절대 건드리지 않는 대신,
     // 갱신은 사용자가 명시적으로 부를 때만 MODELS 줄 하나를 바꾼다.
     if (values['refresh-models']) return runRefreshModels();
+    if (values['refresh-update-check']) return runRefreshUpdateCheck();
     return runInit({ chunk, fallbackModels: String(values.models).split(',').map((m) => m.trim()).filter(Boolean) });
   }
 
-  if (values['refresh-models']) {
-    show('--refresh-models 는 init 서브커맨드 전용이다: youtube-scout init --refresh-models');
-    return 2;
+  for (const flag of ['refresh-models', 'refresh-update-check']) {
+    if (values[flag]) {
+      show(`--${flag} 는 init 서브커맨드 전용이다: youtube-scout init --${flag}`);
+      return 2;
+    }
   }
 
   // 1) 키 확인. 인자로는 절대 받지 않는다 — 셸 히스토리와 프로세스 목록에 남는다.
@@ -754,6 +854,13 @@ async function main() {
   // "이 보고서를 어느 버전으로 뽑았나"를 로그만 보고 알 수 있어야 하기 때문이다
   // (산출물 frontmatter의 scout_version과 같은 목적, 다른 자리).
   log(`youtube-scout v${scoutVersion}`);
+
+  // run.bat을 쓰지 않고 npx를 직접 치는 사용자에게는 update-check.js 경로가 없다.
+  // 여기서 같은 API를 보고 알려만 준다 — **캐시를 지우지는 않는다.** 실행 중인 자기 파일을
+  // 지우는 셈이라 안전하지 않고(파일 잠금), 이미 로드된 코드는 어차피 옛 판이다.
+  //
+  // 부팅 진행과 **병렬로** 돌린다. 3초짜리 조회를 순차로 붙이면 매 실행이 그만큼 느려진다.
+  const updateHint = checkForUpdate();
 
   const requestedModels = String(values.models).split(',');
 
@@ -863,6 +970,13 @@ async function main() {
 
   boot.step('준비 완료');
   boot.end();
+
+  // 병렬로 돌던 확인의 결과를 여기서 받는다. 부팅이 이미 네트워크를 두 번 쳤으므로
+  // 대부분 이미 끝나 있고, 늦어도 3초에서 끊긴다.
+  if (await updateHint) {
+    log('i 새 버전이 있다 — run.bat 사용자는 다음 실행에 자동 적용된다');
+    log(`  (직접 실행 중이라면: youtube-scout init 으로 만든 폴더의 ${UPDATE_CHECK_NAME} 가 이 일을 한다)`);
+  }
 
   // 5) 계획표 + 예상 요청 수. 청크 분할이 요청 수를 곱한다는 사실을 투입 전에 보여준다.
   //

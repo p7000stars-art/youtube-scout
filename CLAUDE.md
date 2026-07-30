@@ -32,6 +32,7 @@
 6. `src/` 모듈은 `process.argv`·`console`·`process.exit`를 직접 사용하지 않는다. 입출력은 전부 `bin/`이 담당한다. (코어/껍데기 분리 — 웹 확장 여지)
 7. 저장소에 개인 경로·개인 링크·키가 단 한 줄도 들어가면 안 된다. 커밋 전 `scripts/check-leak.js`를 실행한다.
 8. 산출물(.md)·소스는 UTF-8 BOM 없음, LF.
+9. **`package.json`의 `version`은 CI가 자동으로 올린다. 수동으로 수정하지 마라** — main 머지마다 `version-bump.yml`이 patch를 올리므로, 사람이 같이 건드리면 충돌이 난다. (사람이 올리는 방식은 이미 실패했다 — 기능 머지 8회 동안 0.2.0에 고정돼 있었고, 그 사이 산출물 여덟 판이 전부 같은 `scout_version`을 달았다)
 
 ---
 
