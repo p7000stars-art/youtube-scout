@@ -233,10 +233,17 @@ i 새 모델 3종을 순환 꼬리에 편입 (검증 풀 소진 시에만 사용
 ```yaml
 model: gemini-3.6-flash
 media_resolution: MEDIA_RESOLUTION_HIGH
-harness: meeting-v1          # 어떤 관찰 규율로 뽑았는지의 각인
+harness: meeting-v1          # 어떤 관찰 규율로 뽑았는지의 각인 (이름)
 chunks: 7/8                  # 성공/전체 — 8개 중 1개가 ⛔다
 status: unverified
+harness_sha256: 9b58a710ac3b # 하네스 내용의 해시 — 이름이 같아도 수정본은 여기서 갈린다
+scout_version: 0.2.0         # 이 산출물을 뽑은 도구 버전
+temperature: 0.1
 ```
+
+무료 등급은 모델을 순환해 쓰기 때문에 **같은 영상을 다시 돌려도 결과가 달라진다.**
+위 다섯 줄(`model`·`harness_sha256`·`scout_version`·`temperature`·`media_resolution`)이
+그때 무엇이 달랐는지 되짚을 근거다. 결과가 이상하면 이전 산출물의 이 값들과 비교해 보면 된다.
 
 ---
 
@@ -268,6 +275,10 @@ status: unverified
 
 하네스는 코드에 하드코딩되어 있지 않다. 파일에서 읽어 `systemInstruction`으로 주입하므로
 누구나 읽고 검증할 수 있고, `--harness`로 교체할 수도 있다.
+
+산출물에는 하네스 **내용의 해시**가 각인된다(`harness_sha256`) — 파일을 수정하면 이름이
+같아도 구분된다. 이름만으로 각인하면 규율을 고쳐 놓고 이름을 그대로 둔 산출물을 원본과
+구별할 방법이 없기 때문이다.
 
 다만 **교체는 산출물에 각인된다.** frontmatter의 `harness:` 값이 바뀐다. 규율을 바꿔서 만든
 보고서와 원본 규율로 만든 보고서는 신뢰 성격이 다른 문서이므로, 나중에 구별할 수 있어야 한다.
