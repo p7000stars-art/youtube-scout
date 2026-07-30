@@ -39,6 +39,15 @@ const TPM_MAX_ATTEMPTS = 2;
  */
 
 /**
+ * 모델을 이번 실행에서 제외하게 만든 사건의 종류.
+ *
+ * 이 루프는 "무엇이 일어났는지"만 알린다. 그것을 어디에 어떻게 기록할지(상태 파일 형식,
+ * 청크 초를 사유에 박는 것 등)는 호출자의 몫이다 — 청크 크기는 사용자 설정이고,
+ * 이 루프는 구간의 시작·끝만 알기 때문이다(마지막 구간은 설정값보다 짧다).
+ * @typedef {'404'|'rpd'|'tpm'} FailureKind
+ */
+
+/**
  * 구간 하나를 추출한다. 재시도와 모델 교체 판단까지 담당한다.
  *
  * ## 재시도 카운터는 "현재 모델에서의 시도 횟수"다 (버그 수정 2026-07-30)
@@ -59,6 +68,13 @@ const TPM_MAX_ATTEMPTS = 2;
  * 주석에 있다. 요약하면 — 단일 사용 키에서 권고 대기 후에도 TPM이면 분당 창이 비었는데도
  * 막힌 것이므로 요청이 한도보다 크다는 뜻이고, 더 기다려도 결과가 바뀌지 않는다.
  *
+ * ## 제외 판정은 `onFailure`로 밖에 알린다
+ * 여기서 내리는 세 판정(404·RPD·구조적 TPM)은 다음 실행에도 유효한 관찰이다. 그런데
+ * `ModelPool`의 제외 집합은 메모리라 프로세스와 함께 사라진다. 그래서 판정 지점마다
+ * 호출자에게 즉시 통보하고, 호출자가 이를 영속화한다(`src/model-status.js`).
+ * 통보는 `await`한다 — 기록이 실제로 남은 뒤에 다음 모델로 넘어가야, 중간에 죽어도
+ * 이번 실행의 관찰이 남는다.
+ *
  * @param {{
  *   apiKey: string, model: string, id: string, url?: string,
  *   start: number, end: number, harness: string,
@@ -67,6 +83,7 @@ const TPM_MAX_ATTEMPTS = 2;
  *   log?: (msg: string) => void,
  *   wait?: (ms: number, label: string) => Promise<void>,
  *   onModelChange?: (model: string) => void,
+ *   onFailure?: (model: string, kind: FailureKind) => void|Promise<void>,
  * }} p
  * @returns {Promise<ChunkOk|ChunkFail>}
  */
@@ -77,6 +94,7 @@ export async function runChunk(p) {
     log = () => {},
     wait = sleep,
     onModelChange = () => {},
+    onFailure = () => {},
   } = p;
 
   let model = p.model;
@@ -135,6 +153,9 @@ export async function runChunk(p) {
 
         if (info.isDaily) {
           // 실측: RPD는 대기해도 안 풀린다 → 즉시 모델 교체. 재시도하지 않는다.
+          // 관찰을 발생 즉시 넘긴다(await). 실행 종료 시점에 모아서 쓰면 중단·강제 종료에서
+          // 통째로 날아간다 — 재개 지원이 구간 파일을 즉시 flush하는 것과 같은 이유다.
+          await onFailure(model, 'rpd');
           const next = pool.markExhausted(model);
           if (!swapTo(next)) {
             return { ok: false, daily: true, poolEmpty: true, reason: 'RPD (전 모델 소진)', model };
@@ -146,6 +167,7 @@ export async function runChunk(p) {
         // TPM/RPM. 한 번은 기다려 보고, 그래도 막히면 구조적 TPM으로 판정한다.
         if (attempt >= TPM_MAX_ATTEMPTS) {
           const blocked = model;
+          await onFailure(blocked, 'tpm');
           const next = pool.markTpmBlocked(blocked);
           log(
             `      429 재발 — 서버 권고 대기를 지켰는데도 막혔다. ` +
@@ -176,6 +198,7 @@ export async function runChunk(p) {
         // 이 키에서는 영구 실패이므로 재시도가 무의미하다 → RPD와 동일하게 즉시 교체.
         // 404는 쿼터를 소모하지 않으므로 좀비가 몇 개든 각 1회 헛손질로 끝난다.
         log(`      404 — 모델 '${model}'은(는) 목록에는 있으나 실사용이 불가하다 (퇴역 추정). 제외한다.`);
+        await onFailure(model, '404');
         const next = pool.markDead(model);
         if (!swapTo(next)) {
           return {

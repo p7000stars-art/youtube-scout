@@ -35,6 +35,16 @@ import {
 } from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
+import {
+  STATUS_FILE_NAME,
+  parseStatus,
+  serializeStatus,
+  pruneStale,
+  recordFailure,
+  applyStatus,
+  statusMessages,
+  promotionMessage,
+} from '../src/model-status.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
 import { spinner, bar, fmtSec } from './ui.js';
 import { runChunk } from './chunk-runner.js';
@@ -79,6 +89,10 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
 
 환경변수:
   GEMINI_API_KEY        필수. 인자로는 받지 않는다 (셸 히스토리 유출 차단)
+
+파일:
+  ${STATUS_FILE_NAME}      실행 폴더에 쌓이는 모델 실패 관찰. 뒤로 미룬 모델(demoted)과
+                        차단된 모델(blocked)이 적혀 있고, 줄을 지우면 그 모델이 복권된다
 `.trim();
 
 // ── 로깅 ────────────────────────────────────────────────────────────
@@ -155,6 +169,65 @@ async function waitVisible(ms, label) {
     activeSpinner = outer;
     outer?.resume();
   }
+}
+
+// ── 모델 상태 파일 ──────────────────────────────────────────────────
+// 지난 실행들의 실패 관찰을 이어받는 곳. 판정·형식은 코어(src/model-status.js)가 하고
+// 여기서는 읽기·쓰기와 안내만 한다.
+
+/** 상태 파일 경로. out 아래가 아니라 실행 폴더(cwd)다 — links.txt 옆이 사람이 찾을 자리다. */
+/** @type {string|null} */
+let statusPath = null;
+
+/** @type {import('../src/model-status.js').StatusEntry[]} */
+let statusEntries = [];
+
+/** 이번 실행에서 blocked로 확정된 기록. 요약에서 한 번 알린다. @type {import('../src/model-status.js').StatusEntry[]} */
+const promotions = [];
+
+/** 쓰기 실패 안내는 한 번만 한다 — 청크마다 같은 경고가 쏟아지면 진짜 로그가 묻힌다. */
+let statusWriteWarned = false;
+
+/**
+ * 상태를 파일에 즉시 반영한다.
+ *
+ * 쓰기 실패로 추출을 중단하지 않는다. 상태 파일은 다음 실행을 빠르게 하는 보조 장치이고,
+ * 이것 때문에 이미 진행한 추출을 버리면 우선순위가 뒤집힌다 (병합 대체 저장과 같은 판단).
+ */
+async function writeStatusFile() {
+  if (!statusPath) return;
+  try {
+    await writeFile(statusPath, serializeStatus(statusEntries), 'utf8');
+  } catch (e) {
+    if (!statusWriteWarned) {
+      statusWriteWarned = true;
+      log(`⚠️ 모델 상태를 기록하지 못했다 (${STATUS_FILE_NAME}): ${e instanceof Error ? e.message : String(e)}`);
+      log('   이번 실행은 그대로 진행한다. 다음 실행이 같은 탐사를 반복할 수 있다.');
+    }
+  }
+}
+
+/**
+ * 모델 제외 판정을 기록한다. **발생 즉시 파일까지 flush한다** — 실행이 중단돼도
+ * 관찰이 남아야 하기 때문이다(구간 파일을 즉시 쓰는 것과 같은 이유).
+ *
+ * 청크 초를 사유에 박는 것은 여기서 한다. tpm 판정은 요청 크기에 달린 조건부 판정이라
+ * "몇 초 청크에서 막혔는지"가 판정의 일부다. 청크 설정을 아는 층이 이 껍데기다.
+ *
+ * @param {string} model
+ * @param {import('./chunk-runner.js').FailureKind} kind
+ * @param {number} chunk
+ */
+async function recordModelFailure(model, kind, chunk) {
+  const reason = kind === 'tpm' ? `tpm-${chunk}` : kind;
+  const r = recordFailure(statusEntries, { model, reason, date: today() });
+  statusEntries = r.entries;
+  if (r.promoted) {
+    promotions.push(r.entry);
+    // 화면에는 요약에서 한 번만 낸다. 로그 파일에는 발생 시점이 남아야 추적이 된다.
+    logFile(stamp(`      ${promotionMessage(r.entry)}`));
+  }
+  await writeStatusFile();
 }
 
 /** @param {number} sec */
@@ -357,6 +430,8 @@ async function runVideo(p) {
         onModelChange: (m) => {
           shownModel = m;
         },
+        // 제외 판정(404·RPD·구조적 TPM)을 상태 파일에 즉시 남긴다.
+        onFailure: (m, kind) => recordModelFailure(m, kind, p.chunk),
       });
     } finally {
       activeSpinner = null;
@@ -544,6 +619,30 @@ async function main() {
 
   const requestedModels = String(values.models).split(',');
 
+  // 3-4) 모델 상태 파일 로딩. 지난 실행들이 남긴 실패 관찰을 이어받는다.
+  //      없는 파일은 빈 상태다 — 첫 실패가 생길 때 도구가 만든다(init은 만들지 않는다).
+  statusPath = join(process.cwd(), STATUS_FILE_NAME);
+  let statusText = '';
+  try {
+    statusText = await readFile(statusPath, 'utf8');
+  } catch {
+    // 읽지 못하면 관찰이 없는 것으로 본다. 상태는 보조 장치라 실행을 막지 않는다.
+  }
+  const parsedStatus = parseStatus(statusText);
+  for (const w of parsedStatus.warnings) log(`⚠️ ${w}`);
+
+  // rpd 기록은 자정에 사실이 아니게 된다. 남겨 두면 멀쩡한 모델이 영구히 뒤로 밀린다.
+  const pruned = pruneStale(parsedStatus.entries, today());
+  statusEntries = pruned.entries;
+  if (pruned.dropped.length) {
+    log(
+      `i 날짜가 지난 일일 한도 기록 ${pruned.dropped.length}건을 소거했다: ` +
+      `${pruned.dropped.map((e) => e.model).join(', ')}`,
+    );
+    // 파일에도 반영한다. 화면과 파일이 다르면 사용자가 어느 쪽을 믿을지 알 수 없다.
+    await writeStatusFile();
+  }
+
   // 3-5) 부팅 대조 1회. `/v1beta/models`는 generateContent 쿼터를 쓰지 않으므로
   //      본 작업의 예산을 깎지 않는다. 조회가 실패하면 조용히 생략한다 —
   //      대조는 보조 기능이고, 이것 때문에 추출이 막히면 우선순위가 뒤집힌다.
@@ -551,10 +650,27 @@ async function main() {
   const reconciled = reconcilePool(requestedModels, available);
   for (const line of reconcileMessages(reconciled)) log(line);
 
+  // 3-6) 상태 반영: blocked는 제외, demoted는 순환 꼬리로. 대조 **뒤**에 적용한다 —
+  //      대조에서 이미 사라진 모델까지 상태 안내를 내면 같은 사실을 두 번 말하게 된다.
+  const applied = applyStatus({ pool: reconciled.pool, entries: statusEntries, chunk });
+  for (const line of statusMessages(applied)) log(line);
+
+  if (!applied.pool.length && applied.blocked.length) {
+    // 전부 차단된 상태로 실행하면 "모델 목록이 유효하지 않다"는 엉뚱한 안내가 나간다.
+    // 원인이 상태 파일이라는 것과 복권 방법을 바로 알려 준다.
+    show('');
+    show(`쓸 수 있는 모델이 없다 — 지정한 모델이 전부 ${STATUS_FILE_NAME}에서 차단돼 있다.`);
+    show(`  ${statusPath}`);
+    show('  차단을 되돌리려면 해당 모델의 줄을 지우고 저장한 뒤 다시 실행하라.');
+    show('  (--models 로 다른 모델을 지정해도 된다)');
+    show('  API를 한 번도 호출하지 않았다.');
+    return 1;
+  }
+
   /** @type {ModelPool} */
   let pool;
   try {
-    pool = new ModelPool(reconciled.pool);
+    pool = new ModelPool(applied.pool);
   } catch {
     show(`--models 값이 유효하지 않다: ${values.models}`);
     return 2;
@@ -688,6 +804,14 @@ async function main() {
       `이 모델의 분당 토큰 한도가 현재 청크(${chunk}초)를 받아내지 못한다. ` +
       `--chunk 를 줄이면 쓸 수 있다`,
     );
+  }
+  // 승격 안내. 위 세 줄(소진/퇴역/순간한도)은 "이번 실행에서 무슨 일이 있었나"이고,
+  // 이 줄은 "다음 실행이 달라진다"는 예고다. 성질이 달라 따로 낸다.
+  for (const e of promotions) {
+    show(`  ${promotionMessage(e)}`);
+  }
+  if (statusEntries.length) {
+    show(`  모델 상태 파일: ${statusPath} (줄을 지우면 그 모델이 복권된다)`);
   }
   show(`  산출물: ${outDir}`);
   show(`  로그:   ${logPath}`);
