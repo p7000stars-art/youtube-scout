@@ -1,0 +1,46 @@
+# main에 머지되면 package.json의 patch를 1 올린다.
+#
+# 왜 자동인가: version은 산출물 frontmatter에 `scout_version`으로 각인된다. 즉 "이 보고서를
+# 어느 코드로 뽑았나"의 유일한 단서다. 그런데 사람이 올리는 방식은 이미 실패했다 —
+# 기능 머지 8회 동안 0.2.0에 고정돼 있었다. 각인이 재현의 조건인데 그 값이 멈춰 있으면
+# 서로 다른 여덟 판의 산출물이 전부 같은 번호를 달게 된다.
+#
+# 왜 patch만인가: 각인에 필요한 것은 **구분 가능한 번호**뿐이다. SemVer의 의미 구분
+# (기능/파괴적 변경)은 이 규모에 과하고, 사람이 판단해야 하는 순간 다시 잊힌다.
+#
+# 왜 태그·릴리스를 만들지 않는가: 배포 경로가 `npx github:...` 하나뿐이라 태그를 아무도
+# 보지 않는다. 지금 규모에 과한 장치는 관리 비용만 남는다.
+name: version-bump
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    # 무한 루프 방지. 이 잡이 만든 커밋도 push(main) 이벤트를 다시 일으키므로, 자기
+    # 커밋에는 반응하지 않아야 한다. 커밋 메시지의 [skip ci] 와 이 조건이 한 쌍이다 —
+    # 둘 중 하나만 두면 나머지 하나가 사라졌을 때 조용히 루프가 돈다.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: patch 버전 증가
+        id: bump
+        run: echo "version=$(node scripts/bump-version.js)" >> "$GITHUB_OUTPUT"
+
+      - name: 커밋·푸시
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # package.json 하나만 담는다. 다른 파일이 섞이면 이 잡이 무엇을 했는지 흐려진다.
+          git add package.json
+          # 올릴 것이 없으면(누군가 이미 올렸다면) 실패가 아니라 무동작이다.
+          git diff --cached --quiet && exit 0
+          git commit -m 'chore: v${{ steps.bump.outputs.version }} [skip ci]'
+          git push

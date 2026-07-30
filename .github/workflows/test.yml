@@ -1,0 +1,36 @@
+# PR·push 검증.
+#
+# 왜 CI인가: 이 저장소에는 지금까지 CI가 없었다. PR마다 체크런이 0개였고, 테스트 통과는
+# 작업자의 보고로만 확인됐다. 보고는 증거가 아니다 — 실행 결과가 증거다.
+#
+# 왜 설치 단계가 없는가: 런타임 의존성 0이 이 도구의 설계 전제라서 npm ci 로 받을 것이
+# 아무것도 없다. 설치 단계가 있으면 언젠가 의존성이 슬쩍 들어와도 눈치채지 못한다.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # 지원 하한(20)과 현행(22)을 둘 다 돌린다. package.json의 engines가
+      # ">=20"이라고 선언한 이상, 20에서 도는지는 실제로 확인돼야 하는 사실이다.
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 단위 테스트
+        run: node --test
+
+      - name: 유출 검사 (키·개인 경로)
+        run: node scripts/check-leak.js
