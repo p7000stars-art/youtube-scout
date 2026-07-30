@@ -139,6 +139,43 @@ test('ModelPool: 퇴역+RPD가 겹쳐 전 모델이 빠지면 배정이 null이�
   assert.ok(pool.allExhausted());
 });
 
+test('ModelPool: TPM 차단은 RPD·퇴역과 별도 집합이다 (해법이 셋 다 다르다)', () => {
+  // RPD는 내일, 퇴역은 목록에서 제거, TPM 차단은 청크 축소 — 뭉치면 엉뚱한 조치를 한다.
+  const pool = new ModelPool(['slow-flash', 'ok-flash']);
+  const next = pool.markTpmBlocked('slow-flash');
+  assert.equal(next, 'ok-flash');
+  assert.deepEqual([...pool.tpmBlocked], ['slow-flash']);
+  assert.deepEqual([...pool.exhausted], []);
+  assert.deepEqual([...pool.dead], []);
+  assert.deepEqual(pool.available(), ['ok-flash']);
+});
+
+test('ModelPool: 세 집합이 겹쳐 전부 빠지면 배정이 null이다', () => {
+  const pool = new ModelPool(['a', 'b', 'c']);
+  pool.markDead('a');
+  pool.markExhausted('b');
+  assert.equal(pool.markTpmBlocked('c'), null);
+  assert.equal(pool.allExhausted(), true);
+  assert.equal(pool.assign(), null);
+  assert.equal(pool.nextAvailable(), null);
+});
+
+test('nextAvailable은 우선순위 순서로 고른다 (교체가 꼬리 모델로 새지 않게)', () => {
+  // 목록 순서가 우선순위다. 꼬리에는 판독력이 미검증인 신모델이 있다(models.js 꼬리 편입).
+  // 교체에 커서(assign)를 쓰면 검증된 앞쪽이 남아 있는데도 꼬리로 넘어간다.
+  const pool = new ModelPool(['verified-a', 'verified-b', 'unverified-tail']);
+  pool.assign(); // 커서를 1로 밀어 둔다
+  assert.equal(pool.nextAvailable(), 'verified-a', '커서와 무관하게 항상 최우선');
+  assert.equal(pool.markDead('verified-a'), 'verified-b', '꼬리가 아니라 다음 검증 모델');
+  assert.equal(pool.markTpmBlocked('verified-b'), 'unverified-tail', '검증 풀 소진 뒤에야 꼬리');
+});
+
+test('assign은 순환을 유지한다 (영상을 모델에 흩어 RPD를 합쳐 쓴다)', () => {
+  // 교체 규칙을 바꿨어도 영상 단위 배정은 그대로여야 한다.
+  const pool = new ModelPool(['a', 'b', 'c']);
+  assert.deepEqual([pool.assign(), pool.assign(), pool.assign(), pool.assign()], ['a', 'b', 'c', 'a']);
+});
+
 test('기본 상수는 실측치', () => {
   assert.equal(MAX_RETRIES, 3);
   assert.equal(CALL_INTERVAL_MS, 6_000);
