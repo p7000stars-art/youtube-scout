@@ -237,7 +237,12 @@ test('demoted 모델은 제외가 아니라 맨 뒤로 간다 — 신모델 꼬�
   const pool = ['user-a-flash', 'user-b-flash', 'new-x-flash', 'new-y-flash'];
   const a = apply(`user-a-flash demoted rpd x1 ${TODAY}`, pool);
   assert.deepEqual(a.pool, ['user-b-flash', 'new-x-flash', 'new-y-flash', 'user-a-flash']);
-  assert.match(statusMessages(a)[0], /^! user-a-flash .*맨 뒤로 미룬다/);
+  // 문구는 완료형이어야 한다. "미룬다"는 "아직 앞에 있고 지금부터 미루겠다"로 읽혀
+  // "왜 이 모델이 먼저 호출되나"라는 질문을 낳았다 (실사용 피드백 2026-07-30).
+  const msg = statusMessages(a)[0];
+  assert.match(msg, /^! user-a-flash — 이전 실행 실패 이력 \(rpd x1\) → 순환 맨 뒤로 미뤄둠/);
+  assert.match(msg, /이번 실행의 호출 순서에 이미 반영됨/);
+  assert.ok(!/미룬다/.test(msg), '미래형 문구가 남아 있으면 안 된다');
 });
 
 test('demoted가 여럿이면 원래 순서를 유지한 채 뒤로 간다', () => {

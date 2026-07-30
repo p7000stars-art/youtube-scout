@@ -338,8 +338,12 @@ export function statusMessages(a) {
     );
   }
   for (const e of a.demoted) {
+    // "미룬다"는 미래형으로 읽혀 "아직 앞에 있고 지금부터 미루겠다"로 오독됐다
+    // (실사용 피드백 2026-07-30: 사용자가 "왜 이 모델이 먼저 호출되나"라고 물었다).
+    // 실제로는 이 안내를 내기 전에 순서가 이미 바뀌어 있다 — 완료형으로 못 박는다.
     lines.push(
-      `! ${e.model} — 이전 실행에서 실패 이력 (${e.reason} x${e.count}) → 모델 순환의 맨 뒤로 미룬다`,
+      `! ${e.model} — 이전 실행 실패 이력 (${e.reason} x${e.count}) → 순환 맨 뒤로 미뤄둠 ` +
+      `(이번 실행의 호출 순서에 이미 반영됨)`,
     );
   }
   for (const e of a.ignored) {
