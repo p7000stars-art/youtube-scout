@@ -78,9 +78,11 @@ export function quotaMessage(info, model) {
     );
   }
   const sec = Math.round(info.waitMs / 1000);
+  // 재시도 횟수를 여기서 말하지 않는다. 경로마다 예산이 다르고(TPM은 1회, 5xx는 3회),
+  // 한쪽 값을 적어 두면 다른 쪽에서 거짓말이 된다. 남은 시도는 호출자가 안다.
   return (
     `429 TPM/RPM — 순간 한도에 걸렸다. ${sec}초 대기 후 재시도한다 ` +
-    `(최대 ${MAX_RETRIES}회, 서버 권고 ${info.retryDelaySec}초).`
+    `(서버 권고 ${info.retryDelaySec}초).`
   );
 }
 

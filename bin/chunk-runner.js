@@ -14,6 +14,26 @@ import { extractChunk, ExtractError } from '../src/extract.js';
 import { parse429, quotaMessage, forbiddenMessage, MAX_RETRIES, sleep } from '../src/quota.js';
 
 /**
+ * TPM 경로에서 한 모델에 주는 시도 횟수. **2시도 = 초기 1회 + 재시도 1회(대기 1번).**
+ *
+ * ## 왜 3회가 아니라 1회만 기다리는가 (실측 2026-07-30)
+ * 이 도구는 개인 키 하나로 순차 호출한다 — 즉 우리 말고 이 쿼터를 쓰는 주체가 없다.
+ * 그러면 서버 권고 `retryDelay`만큼 기다린 뒤에는 **분당 창이 리셋된 상태**다.
+ * 그런데도 또 TPM이 온다면 남은 해석은 하나뿐이다: 요청 하나가 분당 한도보다 크다.
+ * 창이 비었는데 들어가지 못하는 것이므로 **시간이 해결해 줄 수 없다**(구조적 TPM).
+ *
+ * 실측: gemini-2.0-flash-lite가 권고 대기를 지킨 4회 시도·약 3분 동안 한 번도 통과하지
+ * 못했다. 그 3분은 판정에 아무 정보도 더해 주지 않았다 — 2번째 TPM에서 이미 알 수 있었다.
+ *
+ * 그래서 2번째 TPM을 판정 시점으로 삼는다. 첫 대기를 남겨 두는 이유는 진짜 일시 혼잡
+ * (다른 프로세스가 같은 키를 쓰는 경우 등)과 구별하기 위해서다 — 한 번은 봐준다.
+ *
+ * 5xx 경로는 성질이 다르므로 그대로 `MAX_RETRIES`(3회)를 쓴다. 서버 혼잡은 시간이
+ * 실제로 해결해 주는 문제다.
+ */
+const TPM_MAX_ATTEMPTS = 2;
+
+/**
  * @typedef {{ ok: true, text: string, tokens: number, model: string }} ChunkOk
  * @typedef {{ ok: false, daily: boolean, poolEmpty: boolean, reason: string, model: string }} ChunkFail
  */
@@ -33,6 +53,11 @@ import { parse429, quotaMessage, forbiddenMessage, MAX_RETRIES, sleep } from '..
  * 구세대 모델의 분당 토큰 한도가 480초 청크 입력(약 14만 토큰)보다 작으면 **구조적 TPM**이라
  * 같은 모델로는 영원히 통과하지 못한다. 시간이 해결해 주지 않는 문제에 시간을 쓰고 나서
  * 남은 12개를 안 써 보고 포기했던 것이다. 이제 그 모델을 이번 실행에서 제외하고 교체한다.
+ *
+ * ## 구조적 TPM은 2번째 TPM에서 판정한다 (후속 수정 2026-07-30)
+ * 판정에 3회 재시도가 필요하지 않다는 것이 실측으로 드러났다. 근거는 `TPM_MAX_ATTEMPTS`
+ * 주석에 있다. 요약하면 — 단일 사용 키에서 권고 대기 후에도 TPM이면 분당 창이 비었는데도
+ * 막힌 것이므로 요청이 한도보다 크다는 뜻이고, 더 기다려도 결과가 바뀌지 않는다.
  *
  * @param {{
  *   apiKey: string, model: string, id: string, url?: string,
@@ -118,14 +143,14 @@ export async function runChunk(p) {
           continue;
         }
 
-        // TPM/RPM. 대기가 통할 수 있으므로 같은 모델로 재시도하되, 소진하면 모델을 바꾼다.
-        if (attempt > MAX_RETRIES) {
+        // TPM/RPM. 한 번은 기다려 보고, 그래도 막히면 구조적 TPM으로 판정한다.
+        if (attempt >= TPM_MAX_ATTEMPTS) {
           const blocked = model;
           const next = pool.markTpmBlocked(blocked);
           log(
-            `      429 반복 (${MAX_RETRIES}회 재시도 실패) — 모델 '${blocked}'의 순간 한도가 ` +
-            `이 청크 크기를 받아내지 못한다. 이번 실행에서 제외한다 ` +
-            `(--chunk 를 줄이면 이 모델도 쓸 수 있다).`,
+            `      429 재발 — 서버 권고 대기를 지켰는데도 막혔다. ` +
+            `순간 한도가 아니라 모델 '${blocked}'의 용량 부족으로 판단 — 즉시 교체하고 ` +
+            `이번 실행에서 제외한다 (--chunk 를 줄이면 이 모델도 쓸 수 있다).`,
           );
           if (!swapTo(next)) {
             return {

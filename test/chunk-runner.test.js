@@ -6,6 +6,12 @@ import { runChunk } from '../bin/chunk-runner.js';
 import { ExtractError } from '../src/extract.js';
 import { ModelPool, MAX_RETRIES } from '../src/quota.js';
 
+/**
+ * TPM 경로가 한 모델에 주는 시도 횟수 (초기 1회 + 재시도 1회).
+ * chunk-runner의 TPM_MAX_ATTEMPTS와 짝이다 — 그쪽을 바꾸면 이 값도 바꿔야 한다.
+ */
+const TPM_ATTEMPTS = 2;
+
 // 이 루프의 결함은 실패가 순서대로 겹칠 때만 드러난다. 실 API로는 재현할 방법이 없으므로
 // 모델별 응답 시퀀스를 주입해 고정한다. 대기는 no-op으로 바꿔 실시간을 쓰지 않는다.
 
@@ -74,34 +80,34 @@ test('교체는 재시도 카운터를 소모하지 않는다 — 교체 2회 �
     {
       A: ['404'],
       B: ['rpd'],
-      C: ['tpm', 'tpm', 'tpm', 'ok'], // 초기 1회 + 재시도 3회 = 4번째에 성공
+      C: ['tpm', 'ok'], // 초기 1회 + 재시도 1회 = 2번째에 성공
     },
   );
   const res = await promise;
 
   assert.equal(res.ok, true, `실패했다: ${res.ok === false ? res.reason : ''}`);
   assert.equal(res.model, 'C');
-  assert.equal(mock.countFor('C'), 4, 'C는 초기 1회 + 재시도 3회를 온전히 받는다');
+  assert.equal(mock.countFor('C'), TPM_ATTEMPTS, 'C는 TPM 예산을 온전히 받는다');
   assert.equal(mock.countFor('A'), 1, '404는 재시도하지 않는다');
   assert.equal(mock.countFor('B'), 1, 'RPD는 재시도하지 않는다');
 });
 
-test('교체 없이 단독 모델이면 재시도 횟수가 그대로다 (회귀 방지)', async () => {
-  const { promise, mock } = run(['A'], { A: ['tpm', 'tpm', 'tpm', 'ok'] });
+test('교체 없이 단독 모델도 TPM 예산을 온전히 받는다 (회귀 방지)', async () => {
+  const { promise, mock } = run(['A'], { A: ['tpm', 'ok'] });
   const res = await promise;
   assert.equal(res.ok, true);
-  assert.equal(mock.countFor('A'), 4);
+  assert.equal(mock.countFor('A'), TPM_ATTEMPTS);
 });
 
 test('404 교체가 여러 번 겹쳐도 마지막 모델의 예산은 온전하다', async () => {
   const { promise, mock } = run(
     ['A', 'B', 'C', 'D'],
-    { A: ['404'], B: ['404'], C: ['404'], D: ['tpm', 'tpm', 'tpm', 'ok'] },
+    { A: ['404'], B: ['404'], C: ['404'], D: ['tpm', 'ok'] },
   );
   const res = await promise;
   assert.equal(res.ok, true);
   assert.equal(res.model, 'D');
-  assert.equal(mock.countFor('D'), 4);
+  assert.equal(mock.countFor('D'), TPM_ATTEMPTS);
 });
 
 // ── 버그 2: TPM 소진 시 모델 교체 누락 ──────────────────────────────
@@ -110,33 +116,36 @@ test('TPM 재시도를 소진하면 청크 실패가 아니라 모델을 바꾼�
   // 실측: TPM 3회 초과로 청크가 실패 확정됐는데 풀에 가용 모델 12개가 남아 있었다.
   const { promise, pool, mock } = run(
     ['A', 'B'],
-    { A: ['tpm', 'tpm', 'tpm', 'tpm'], B: ['ok'] },
+    { A: ['tpm'], B: ['ok'] }, // A는 계속 TPM
   );
   const res = await promise;
 
   assert.equal(res.ok, true, '남은 모델로 성공해야 한다');
   assert.equal(res.model, 'B');
-  assert.equal(mock.countFor('A'), MAX_RETRIES + 1);
+  assert.equal(mock.countFor('A'), TPM_ATTEMPTS);
   assert.equal(mock.countFor('B'), 1);
   assert.deepEqual([...pool.tpmBlocked], ['A'], 'A는 이번 실행에서 제외된다');
 });
 
 test('TPM 제외는 RPD·퇴역과 다른 집합이다 (요약 안내가 달라야 한다)', async () => {
-  const { promise, pool } = run(['A', 'B'], { A: ['tpm', 'tpm', 'tpm', 'tpm'], B: ['ok'] });
+  const { promise, pool } = run(['A', 'B'], { A: ['tpm'], B: ['ok'] });
   await promise;
   assert.deepEqual([...pool.tpmBlocked], ['A']);
   assert.deepEqual([...pool.exhausted], [], 'RPD 집합에 섞이지 않는다');
   assert.deepEqual([...pool.dead], [], '퇴역 집합에 섞이지 않는다');
 });
 
-test('TPM 제외 안내는 청크 축소를 알려준다 (해법이 RPD와 다르다)', async () => {
-  const { promise, logs } = run(['A', 'B'], { A: ['tpm', 'tpm', 'tpm', 'tpm'], B: ['ok'] });
+test('TPM 제외 안내는 판정 근거와 청크 축소를 함께 알려준다', async () => {
+  const { promise, logs } = run(['A', 'B'], { A: ['tpm'], B: ['ok'] });
   await promise;
   // 재시도 중 안내(quotaMessage)에도 '순간 한도'가 들어가므로 제외 안내는 --chunk로 찾는다
   const notice = logs.find((l) => l.includes('--chunk'));
   assert.ok(notice, `제외 안내가 없다: ${JSON.stringify(logs)}`);
+  // 왜 포기하는지(판정) + 무엇이 달라지는지(제외) + 사용자가 할 수 있는 것(청크 축소)
+  assert.match(notice, /서버 권고 대기를 지켰는데도/, '판정 근거를 밝힌다');
+  assert.match(notice, /순간 한도가 아니라/, '순간 한도로 오독되지 않게 못 박는다');
+  assert.match(notice, /용량 부족/);
   assert.match(notice, /이번 실행에서 제외/);
-  assert.match(notice, /순간 한도/);
   // 재시도 단계의 안내와 제외 단계의 안내는 서로 다른 줄이다
   assert.ok(logs.some((l) => l.includes('대기 후 재시도한다')), '재시도 안내도 남는다');
 });
@@ -155,9 +164,74 @@ test('전 모델이 TPM으로 막힐 때만 청크가 실패한다', async () =>
     assert.match(res.reason, /순간 한도/);
   }
   assert.deepEqual([...pool.tpmBlocked].sort(), ['A', 'B']);
-  // 각 모델당 초기 1회 + 재시도 3회씩만 쓰고 끝난다
-  assert.equal(mock.countFor('A'), MAX_RETRIES + 1);
-  assert.equal(mock.countFor('B'), MAX_RETRIES + 1);
+  // 각 모델당 TPM 예산(2시도)만 쓰고 끝난다
+  assert.equal(mock.countFor('A'), TPM_ATTEMPTS);
+  assert.equal(mock.countFor('B'), TPM_ATTEMPTS);
+});
+
+// ── 구조적 TPM 조기 판정 ────────────────────────────────────────────
+
+test('TPM → 대기 → TPM 이면 3회를 기다리지 않고 즉시 교체한다', async () => {
+  // 단일 사용 키에서 권고 대기 후에도 TPM이면 분당 창이 비었는데 막힌 것 —
+  // 요청이 한도보다 크다는 뜻이라 더 기다려도 결과가 바뀌지 않는다 (구조적 TPM).
+  // 실측: 2.0-flash-lite가 권고 준수 4회 시도 약 3분에도 통과하지 못했다.
+  let waits = 0;
+  const { promise, pool, mock } = run(
+    ['slow', 'fast'],
+    { slow: ['tpm', 'tpm', 'tpm', 'tpm'], fast: ['ok'] },
+    { wait: async () => { waits += 1; } },
+  );
+  const res = await promise;
+
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'fast');
+  assert.equal(mock.countFor('slow'), 2, '2시도만 쓴다 (초기 1회 + 재시도 1회)');
+  assert.equal(waits, 1, '대기는 딱 한 번 — 나머지 두 번의 대기가 사라졌다');
+  assert.deepEqual([...pool.tpmBlocked], ['slow']);
+});
+
+test('TPM → 대기 → 성공이면 기존대로 통과한다 (일시 혼잡을 구조적 TPM으로 오판하지 않는다)', async () => {
+  // 첫 대기를 남겨 둔 이유가 이 경로다. 다른 프로세스가 같은 키를 쓰는 등 진짜 일시
+  // 혼잡이면 한 번 기다리면 풀린다 — 그때 모델을 버리면 멀쩡한 모델을 잃는다.
+  let waits = 0;
+  const { promise, pool, mock } = run(
+    ['A', 'B'],
+    { A: ['tpm', 'ok'], B: ['ok'] },
+    { wait: async () => { waits += 1; } },
+  );
+  const res = await promise;
+
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'A', '같은 모델로 통과한다');
+  assert.equal(waits, 1);
+  assert.equal(mock.countFor('A'), 2);
+  assert.equal(mock.countFor('B'), 0, '교체가 일어나지 않는다');
+  assert.deepEqual([...pool.tpmBlocked], [], '멀쩡한 모델을 버리지 않는다');
+});
+
+test('구조적 TPM 판정은 모델마다 새로 한다 (교체된 모델도 한 번은 기다려 본다)', async () => {
+  let waits = 0;
+  const { promise, mock } = run(
+    ['A', 'B'],
+    { A: ['tpm'], B: ['tpm', 'ok'] },
+    { wait: async () => { waits += 1; } },
+  );
+  const res = await promise;
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'B');
+  assert.equal(mock.countFor('A'), 2);
+  assert.equal(mock.countFor('B'), 2, 'B도 자기 몫의 대기를 받는다');
+  assert.equal(waits, 2);
+});
+
+test('5xx는 여전히 3회까지 재시도한다 (서버 혼잡은 시간이 해결해 준다)', async () => {
+  // TPM 예산만 줄였다. 성질이 다른 경로를 함께 줄이면 일시적 혼잡에서 멀쩡한 모델을 버린다.
+  const { promise, mock } = run(['A', 'B'], { A: ['500', '500', '500', 'ok'] });
+  const res = await promise;
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'A');
+  assert.equal(mock.countFor('A'), MAX_RETRIES + 1, '초기 1회 + 재시도 3회');
+  assert.equal(mock.countFor('B'), 0);
 });
 
 // ── 무한 순환 방지 ──────────────────────────────────────────────────
@@ -176,11 +250,11 @@ test('한 청크가 시도하는 모델 수는 풀 크기를 넘지 않는다', 
   assert.equal(mock.calls.length, models.length, '모델당 정확히 1회씩만 헛손질한다');
 });
 
-test('전 모델 TPM에서도 호출 총량이 풀 크기 × (재시도+1)을 넘지 않는다', async () => {
+test('전 모델 TPM에서도 호출 총량이 풀 크기 × TPM 예산을 넘지 않는다', async () => {
   const models = ['A', 'B', 'C'];
   const { promise, mock } = run(models, Object.fromEntries(models.map((m) => [m, ['tpm']])));
   await promise;
-  assert.equal(mock.calls.length, models.length * (MAX_RETRIES + 1));
+  assert.equal(mock.calls.length, models.length * TPM_ATTEMPTS);
 });
 
 // ── 기존 동작 회귀 ──────────────────────────────────────────────────
