@@ -26,7 +26,7 @@
  * 아래 함수들을 import해서 검증한다. 사본과 원본이 갈라지지 않도록 진실은 이 파일 하나다.
  */
 
-import { readdir, readFile, stat, rm } from 'node:fs/promises';
+import { readdir, readFile, stat, rm, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -45,6 +45,20 @@ export const GRACE_MS = 60_000;
 
 /** 부팅 앞에 붙는 확인이다. 3초를 넘기면 확인이 아니라 방해가 된다. */
 export const FETCH_TIMEOUT_MS = 3_000;
+
+/**
+ * 종료 안전망. 소켓이 끝내 닫히지 않아 이벤트 루프가 비지 않는 예외 상황에서만 발동한다.
+ * `unref` 이므로 정상 종료를 막지 않는다 — 평소에는 존재조차 드러나지 않는다.
+ */
+export const EXIT_GUARD_MS = 3_000;
+
+/**
+ * Windows 삭제 재시도. `fs.rm`의 내장 옵션이고, 바로 이런 환경을 위해 있는 것이다 —
+ * 백신·탐색기·방금 끝난 프로세스가 폴더를 잠깐 잡고 있으면 EBUSY·ENOTEMPTY가 난다.
+ * 주 사용자 환경이 Windows라 기본값(재시도 0)으로 두면 실환경에서만 실패한다.
+ */
+const RM_RETRIES = 3;
+const RM_RETRY_DELAY_MS = 100;
 
 /** 비인증 GitHub API는 User-Agent가 없으면 403이다. 값은 도구 이름으로 고정한다. */
 const USER_AGENT = 'youtube-scout-update-check';
@@ -184,10 +198,23 @@ export async function fetchLatestCommitMs(opts = {}) {
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${REPO}/commits/main`, {
       signal: ac.signal,
-      headers: { 'User-Agent': USER_AGENT, Accept: 'application/vnd.github+json' },
+      headers: {
+        'User-Agent': USER_AGENT,
+        Accept: 'application/vnd.github+json',
+        // 한 번 쓰고 끝나는 요청이라 연결을 재사용할 이유가 없다. keep-alive 소켓이
+        // 응답 뒤에도 살아 있으면 종료가 그만큼 늦어지고, 그 늦음이 아래 크래시의 조건이었다.
+        connection: 'close',
+      },
     });
-    if (!res.ok) return null; // 403(레이트리밋)·404 전부 여기서 조용히 끝난다
 
+    if (!res.ok) {
+      // 403(레이트리밋)·404. **본문을 버리더라도 스트림은 닫아야 한다** —
+      // 읽지 않은 본문은 소켓을 붙잡고, 그 소켓이 종료 시점까지 남는다.
+      await discardBody(res);
+      return null;
+    }
+
+    // json()은 본문을 끝까지 읽으므로 따로 닫을 것이 없다.
     const json = await res.json();
     const ms = Date.parse(json?.commit?.committer?.date ?? '');
     return Number.isFinite(ms) ? ms : null;
@@ -195,6 +222,18 @@ export async function fetchLatestCommitMs(opts = {}) {
     return null;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * 쓰지 않을 응답 본문을 닫는다. 실패해도 무시한다 — 이미 닫혔거나 본문이 없는 경우다.
+ * @param {Response} res
+ */
+async function discardBody(res) {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // 닫으려다 실패한 것은 우리가 할 수 있는 일이 없다
   }
 }
 
@@ -216,6 +255,45 @@ export function formatCommitTime(ms) {
 }
 
 /**
+ * 캐시 항목 하나를 지우고 **정말 사라졌는지 확인한다.**
+ *
+ * ## 왜 확인까지 하는가 (실측 2026-07-31, Windows)
+ * `rm`이 resolve했는데도 항목이 남아 있는 사례가 나왔다("업데이트 받는 중"을 출력하고도
+ * 캐시가 그대로였다). 지우지 못했는데 지웠다고 말하면, 사용자는 최신판을 받은 줄 알고
+ * 옛 판의 산출물을 신뢰하게 된다 — 이 도구가 가장 피하려는 종류의 거짓말이다.
+ * 그래서 보고의 근거를 "rm이 던지지 않았다"가 아니라 "경로가 실제로 없다"로 바꾼다.
+ *
+ * `rmImpl`은 테스트 이음매다 — "rm은 성공했는데 경로가 남아 있다"는 상황은 실제 파일
+ * 시스템으로 만들 수 없어서(그게 결함의 정의다) 삭제 동작을 바꿔 끼워야 재현된다.
+ *
+ * @param {string} path
+ * @param {{ rmImpl?: typeof rm }} [opts]
+ * @returns {Promise<boolean>} 확실히 사라졌으면 true
+ */
+export async function removeEntry(path, opts = {}) {
+  const { rmImpl = rm } = opts;
+  try {
+    // maxRetries는 Windows의 일시적 잠금(EBUSY·ENOTEMPTY)을 위한 내장 장치다.
+    await rmImpl(path, {
+      recursive: true,
+      force: true,
+      maxRetries: RM_RETRIES,
+      retryDelay: RM_RETRY_DELAY_MS,
+    });
+  } catch {
+    // 잠겨 있거나 권한이 없다 → 이번엔 못 지운 것뿐이다. 다음 실행이 다시 시도한다.
+    return false;
+  }
+
+  try {
+    await access(path);
+    return false; // 아직 있다 = 지우지 못했다. 지웠다고 보고하지 않는다
+  } catch {
+    return true; // 접근 불가 = 사라졌다
+  }
+}
+
+/**
  * @typedef {object} UpdateCheckResult
  * @property {string[]} removed 삭제한 캐시 항목 경로
  * @property {string} skipped   아무것도 하지 않은 사유 (`''`이면 정상 수행)
@@ -233,6 +311,7 @@ export function formatCommitTime(ms) {
  *   fetchImpl?: typeof fetch,
  *   timeoutMs?: number,
  *   out?: (line: string) => void,
+ *   rmImpl?: typeof rm,
  * }} [opts]
  * @returns {Promise<UpdateCheckResult>}
  */
@@ -261,12 +340,7 @@ export async function runUpdateCheck(opts = {}) {
   const removed = [];
   for (const e of entries) {
     if (!needsRefresh({ installedMs: e.installedMs, commitMs })) continue;
-    try {
-      await rm(e.path, { recursive: true, force: true });
-      removed.push(e.path);
-    } catch {
-      // 잠겨 있거나 권한이 없다 → 이번엔 못 지운 것뿐이다. 다음 실행이 다시 시도한다.
-    }
+    if (await removeEntry(e.path, { rmImpl: opts.rmImpl })) removed.push(e.path);
   }
 
   // 평소 실행은 조용해야 한다. 할 일이 없었으면 한 줄도 내지 않는다.
@@ -281,8 +355,27 @@ const invokedDirectly =
   Boolean(process.argv[1]) && pathToFileURL(process.argv[1]).href === import.meta.url;
 
 if (invokedDirectly) {
-  // 어떤 실패든 종료 코드 0이다. 이 스크립트가 실패했다고 본 작업(추출)이 멈추면 안 된다.
+  /**
+   * ## `process.exit()`를 쓰지 않는다 (실측 2026-07-31, Windows 11 / Node 24)
+   * 예전 코드는 `.finally(() => process.exit(0))` 였고, Windows에서 100% 크래시했다:
+   *
+   *     Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 94
+   *     종료코드 0xC0000409
+   *
+   * `process.exit()`는 fetch(undici)의 소켓·타이머가 정리되는 **도중에** 프로세스를 끊는다.
+   * libuv가 닫히는 중인 async 핸들을 만나 abort한다. 그리고 그 abort가 캐시 삭제 정리까지
+   * 끊어서, 기능 자체가 실환경에서 동작하지 않았다. 리눅스에서는 재현되지 않아
+   * ubuntu CI가 그대로 통과했다 — 그래서 이 PR에서 CI에 windows-latest를 추가했다.
+   *
+   * 종료 코드를 **설정만** 하고 이벤트 루프가 자연히 비도록 둔다. "실패해도 0으로 끝난다"는
+   * 원칙은 그대로다 — 아래 catch가 모든 예외를 삼키므로 0 이외의 코드로 끝날 길이 없다.
+   */
+  const guard = setTimeout(() => process.exit(0), EXIT_GUARD_MS);
+  guard.unref(); // 정상 종료를 붙잡지 않는다. 루프가 비면 이 타이머는 없는 것과 같다
+
   runUpdateCheck({ out: (line) => console.log(line) })
     .catch(() => {})
-    .finally(() => process.exit(0));
+    .finally(() => {
+      process.exitCode = 0;
+    });
 }
