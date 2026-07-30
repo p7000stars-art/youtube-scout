@@ -80,7 +80,10 @@ export function buildRunBat({ chunk, models }) {
     'rem never reach the pause below, so the window would vanish.',
     'echo.',
     'echo Done. Output is in the "out" folder next to this file.',
-    'echo Open _merged.md first.',
+    // 파일명을 적을 수 없다 — 최종본 이름이 한글이고 이 파일은 ASCII 전용이다.
+    // 그래서 위치로 가리킨다: 영상 폴더 최상위의 .md 하나가 최종본이다.
+    'echo Each video folder has ONE report .md file at its top level - open that.',
+    'echo The "parts" subfolder holds per-segment originals. You rarely need them.',
     'pause',
     '',
   ];
@@ -132,7 +135,8 @@ export function buildRunSh({ chunk, models }) {
     `npx ${PKG} --file "$DIR/${LINKS_NAME}" -o "$DIR/out" --chunk "$CHUNK" --models "$MODELS"`,
     '',
     'echo',
-    'echo "끝났다. 산출물은 이 파일 옆 out 폴더에 있다. _merged.md 부터 열면 된다."',
+    'echo "끝났다. 산출물은 이 파일 옆 out 폴더에 있다."',
+    'echo "영상별 폴더의 보고서.md 를 열면 된다 (parts 폴더는 구간별 원본이라 볼 일이 없다)."',
     '',
   ].join('\n');
 }
@@ -169,6 +173,8 @@ export function buildLinksTxt() {
     '#   공개 영상만 처리된다 (회원 전용·비공개는 건너뛴다).',
     '#   중간에 끊겨도 다시 실행하면 완료된 구간을 건너뛰고 이어서 한다.',
     '#   산출물은 미검증이다. 명령어·URL·경로 같은 긴 문자열은 공식 소스와 대조할 것.',
+    '#   결과는 out 폴더에 영상별로 생긴다. 각 폴더의 보고서.md 가 최종본이고,',
+    '#   parts 폴더에는 구간별 원본이 들어 있다 (보통 볼 일이 없다).',
     '',
     '# 예시 (이 줄의 # 을 지우고 자기 링크로 바꿔도 된다)',
     '# https://www.youtube.com/watch?v=dQw4w9WgXcQ',

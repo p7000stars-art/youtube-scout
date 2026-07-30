@@ -8,7 +8,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, mkdir, appendFile, access } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, appendFile, access, readdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -21,7 +21,7 @@ import {
   DEFAULT_OVERLAP_SEC,
   DEFAULT_DAILY_LIMIT,
 } from '../src/plan.js';
-import { extractChunk, ExtractError } from '../src/extract.js';
+import { extractChunk, ExtractError, TEMPERATURE } from '../src/extract.js';
 import {
   parse429,
   quotaMessage,
@@ -31,13 +31,38 @@ import {
   MAX_RETRIES,
   CALL_INTERVAL_MS,
 } from '../src/quota.js';
-import { segFileName, segDocument, harnessName, today } from '../src/output.js';
+import {
+  segFileName,
+  segDocument,
+  harnessName,
+  harnessHash,
+  today,
+  videoFolderName,
+  matchVideoFolder,
+  PARTS_DIR,
+} from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
+import { spinner, bar, fmtSec } from './ui.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
+
+/**
+ * 자기 package.json 경로. 버전을 산출물에 각인하려면 어디선가 읽어야 하는데,
+ * src/가 저장소 구조를 알면 껍데기 교체 시 같이 깨진다. 그래서 껍데기가 읽어 인자로 넘긴다.
+ */
+const PKG_PATH = resolve(HERE, '../package.json');
+
+/** @returns {Promise<string>} 읽지 못해도 실행을 막지 않는다 — 각인은 보조 정보다. */
+async function readScoutVersion() {
+  try {
+    return String(JSON.parse(await readFile(PKG_PATH, 'utf8')).version ?? 'unknown');
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** 기본 모델. 단일이다 — 모델을 늘리는 것은 쿼터를 늘리는 선택이라 사용자가 정한다. */
 const DEFAULT_MODELS = 'gemini-3.6-flash';
@@ -68,6 +93,16 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
 /** @type {string|null} */
 let logPath = null;
 
+/**
+ * 지금 화면 한 줄을 점유하고 있는 스피너.
+ *
+ * 추출 중에도 429·404·모델 교체 같은 로그가 끼어든다. 스피너가 `\r`로 같은 줄을
+ * 덮어쓰는 동안 다른 출력이 끼어들면 두 줄이 한 줄에 뒤엉킨다. 그래서 모든 출력은
+ * 먼저 이 줄을 비운다. 스피너는 다음 프레임에 새 줄에 스스로 다시 그린다(자기 치유).
+ * @type {import('./ui.js').Spinner|null}
+ */
+let activeSpinner = null;
+
 /** @param {string} msg */
 function stamp(msg) {
   const d = new Date();
@@ -75,16 +110,50 @@ function stamp(msg) {
   return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}] ${msg}`;
 }
 
+/** 파일에만 남긴다. 화면 출력은 호출자가 따로 정한다 (스피너가 줄을 점유하는 경우). */
+function logFile(line) {
+  if (logPath) appendFile(logPath, `${line}\n`, 'utf8').catch(() => {});
+}
+
 /** @param {string} msg */
 function log(msg) {
   const line = stamp(msg);
+  activeSpinner?.clear();
   console.log(line);
-  if (logPath) appendFile(logPath, `${line}\n`, 'utf8').catch(() => {});
+  logFile(line);
 }
 
 /** 사용자에게 보여주되 로그 파일에는 남기지 않는 순수 표시용 출력 */
 function show(msg = '') {
+  activeSpinner?.clear();
   console.log(msg);
+}
+
+/**
+ * 3초 이상 기다릴 때 남은 시간을 보여준다. 아무 출력 없이 멈춰 있으면
+ * 사용자는 죽은 것으로 오해한다 (이 작업의 출발점이 된 실사용 피드백).
+ *
+ * 3초 미만에는 띄우지 않는다 — 깜빡였다 사라지는 줄이 더 산만하다.
+ * 카운트다운 줄은 화면에만 있고 `_batch.log`에는 남기지 않는다. 대기는 사건이 아니다.
+ *
+ * @param {number} ms
+ * @param {string} label
+ */
+async function waitVisible(ms, label) {
+  if (ms < 3_000 || !process.stdout.isTTY) {
+    await sleep(ms);
+    return;
+  }
+  const until = Date.now() + ms;
+  // 프레임 문자를 쓰지 않는다 — 남은 시간이 줄어드는 것 자체가 살아있다는 신호다.
+  const sp = spinner(() => `   ${label} ${fmtSec(Math.max(0, until - Date.now()))} 남음`);
+  activeSpinner = sp;
+  try {
+    await sleep(ms);
+  } finally {
+    sp.done(''); // 줄을 지우고 아무것도 남기지 않는다
+    activeSpinner = null;
+  }
 }
 
 /** @param {number} sec */
@@ -169,7 +238,7 @@ async function runChunk(p) {
         if (attempt > MAX_RETRIES) {
           return { ok: false, daily: false, reason: `429 재시도 ${MAX_RETRIES}회 초과`, model };
         }
-        await sleep(info.waitMs);
+        await waitVisible(info.waitMs, 'TPM 회복 대기 중...');
         continue;
       }
 
@@ -194,7 +263,7 @@ async function runChunk(p) {
       if (e.status >= 500 && attempt <= MAX_RETRIES) {
         const wait = Math.min(attempt * 10_000, 90_000);
         log(`      HTTP ${e.status} — ${wait / 1000}초 후 재시도 (${attempt}/${MAX_RETRIES})`);
-        await sleep(wait);
+        await waitVisible(wait, '서버 혼잡 대기 중...');
         continue;
       }
 
@@ -275,12 +344,36 @@ async function runInit(p) {
  *   meta: import('../src/meta.js').VideoMeta,
  *   ranges: { start: number, end: number }[],
  *   apiKey: string, model: string, harness: string, harnessLabel: string,
- *   chunk: number, outDir: string, pool: ModelPool
+ *   chunk: number, outDir: string, pool: ModelPool,
+ *   scoutVersion: string, harnessSha: string
  * }} p
  */
 async function runVideo(p) {
-  const dir = join(p.outDir, p.meta.id);
-  await mkdir(dir, { recursive: true });
+  // 폴더 결정. 이름 생성·판정은 코어(output.js)가 하고 디렉터리 나열만 여기서 한다.
+  //
+  // 이미 이 영상의 폴더가 있으면 이름이 어떻든 **그 폴더를 그대로 쓴다.** 제목이 바뀌었다고
+  // 새 폴더를 만들면 이미 뽑아 둔 구간이 이전 폴더에 고립되고, 한도 20회 환경에서
+  // 재개 불가는 곧 실패다. 폴더명을 예쁘게 맞추는 것보다 재개가 우선이다.
+  /** @type {string[]} */
+  let outEntries = [];
+  try {
+    outEntries = (await readdir(p.outDir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    // out을 읽지 못하면 신규로 간주한다. 아래 mkdir이 실제 문제를 드러낸다.
+  }
+  const existing = matchVideoFolder(outEntries, p.meta.id);
+  const folder = existing ?? videoFolderName(p.meta.title, p.meta.id);
+  const dir = join(p.outDir, folder);
+
+  // 새 구간은 parts/ 아래에 쓴다 — 최상위에는 최종본만 남겨 무엇을 열지 구조가 말하게 한다.
+  const partsDir = join(dir, PARTS_DIR);
+  await mkdir(partsDir, { recursive: true });
+
+  // 구간을 찾을 곳: parts/ 우선, 그다음 폴더 최상위(구형 배치).
+  // 구형 폴더에서 재개하면 이전에 최상위에 쓴 구간들이 여기서 인식된다.
+  const segDirs = [partsDir, dir];
 
   let model = p.model;
   /** @type {Set<string>} 실제로 사용된 모델. 구간마다 다를 수 있어 frontmatter에 모두 남긴다 */
@@ -292,21 +385,50 @@ async function runVideo(p) {
   let carriedOver = false;
 
   for (const [i, r] of p.ranges.entries()) {
-    const file = join(dir, segFileName(r.start, r.end));
+    const segName = segFileName(r.start, r.end);
+    const file = join(partsDir, segName); // 새로 쓰는 위치는 항상 parts/
 
     // 재개: 이미 있는 구간은 건너뛴다. 중단된 배치를 처음부터 다시 돌리면
     // 쿼터를 두 번 쓰고, 한도가 20이면 두 번째 실행은 시작도 못 한다.
-    if (await exists(file)) {
+    // 구형 배치(폴더 최상위)에 있던 구간도 완료로 인정해야 재개가 유지된다.
+    let alreadyDone = false;
+    for (const d of segDirs) {
+      if (await exists(join(d, segName))) {
+        alreadyDone = true;
+        break;
+      }
+    }
+    if (alreadyDone) {
       skipped += 1;
       log(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s — 이미 완료, 건너뜀`);
       continue;
     }
 
-    log(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${model})`);
-    const res = await runChunk({
-      apiKey: p.apiKey, model, id: p.meta.id, url: p.meta.url,
-      start: r.start, end: r.end, harness: p.harness, pool: p.pool,
-    });
+    // 청크 추출은 단일 API 호출이라 30초~2분간 출력이 멈춘다. 그 침묵을 사용자가
+    // "죽었다"로 읽는다(실사용 피드백 2026-07-30). TTY에서는 시작 줄을 스피너로 잡아
+    // 경과 시간을 갱신하고, 완료되면 그 줄을 결과 줄로 확정한다.
+    // 非TTY(파이프·리다이렉트)에서는 예전처럼 시작 줄을 그냥 한 줄 출력한다.
+    const startLine = stamp(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${model})`);
+    logFile(startLine); // 로그 파일에는 시작 줄이 항상 남는다 (화면 표현과 무관하게)
+
+    const t0 = Date.now();
+    const sp = spinner((frame) => `${startLine} ${frame} ${fmtSec(Date.now() - t0)}`);
+    activeSpinner = sp.active ? sp : null;
+    if (!sp.active) console.log(startLine);
+
+    /** @type {Awaited<ReturnType<typeof runChunk>>} */
+    let res;
+    try {
+      res = await runChunk({
+        apiKey: p.apiKey, model, id: p.meta.id, url: p.meta.url,
+        start: r.start, end: r.end, harness: p.harness, pool: p.pool,
+      });
+    } finally {
+      activeSpinner = null;
+    }
+    // 소요 시간을 결과 줄에 남긴다 — 지금까지 어디에도 기록이 없었다.
+    // 다음 실행의 청크 크기·모델 선택을 판단할 근거가 된다.
+    const took = fmtSec(Date.now() - t0);
 
     if (res.ok) {
       model = res.model;
@@ -319,10 +441,14 @@ async function runVideo(p) {
       );
       done += 1;
       tokens += res.tokens;
-      log(`      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰)`);
+      const line = stamp(`      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰, ${took})`);
+      sp.done(line); // TTY면 스피너 줄을 이 줄로 확정, 아니면 그냥 출력
+      logFile(line);
     } else {
       failed += 1;
-      log(`      실패: ${res.reason}`);
+      const line = stamp(`      실패: ${res.reason} (${took})`);
+      sp.done(line);
+      logFile(line);
       if (res.daily) {
         // 전 모델 RPD 소진. 남은 구간은 다음 실행으로 이월된다.
         carriedOver = true;
@@ -333,11 +459,12 @@ async function runVideo(p) {
     }
 
     // 실측: 분당 15요청 제한 대비. 마지막 구간 뒤에는 기다릴 이유가 없다.
-    if (i < p.ranges.length - 1) await sleep(CALL_INTERVAL_MS);
+    if (i < p.ranges.length - 1) await waitVisible(CALL_INTERVAL_MS, '호출 간격 대기 중...');
   }
 
   const merged = await mergeVideo({
     dir,
+    segDirs,
     ranges: p.ranges,
     url: p.meta.url,
     meta: {
@@ -351,11 +478,16 @@ async function runVideo(p) {
       okChunks: 0,
       totalChunks: p.ranges.length,
       extracted: today(),
+      // 재현 각인. 하네스는 이름(harness)과 내용 해시(harnessSha) 둘 다 남는다 —
+      // 이름은 사람이 읽고, 해시는 변조를 잡는다.
+      harnessSha: p.harnessSha,
+      scoutVersion: p.scoutVersion,
+      temperature: TEMPERATURE,
     },
   });
 
   if (merged.fallback) {
-    log(`   ⚠️ _merged.md 를 쓰지 못해 대체 저장: ${merged.path}`);
+    log(`   ⚠️ 최종본을 쓰지 못해 대체 저장: ${merged.path}`);
   }
   for (const s of merged.strays) {
     log(`   ⚠️ 계획 밖 잔여 파일 (병합 제외): ${s}`);
@@ -442,6 +574,10 @@ async function main() {
     return 1;
   }
   const harnessLabel = harnessName(harnessPath);
+  // 이름이 아니라 내용으로 각인한다 — meeting-v1.md를 고치고 이름을 그대로 두면
+  // 변조된 규율의 보고서가 원본과 구분되지 않는다.
+  const harnessSha = harnessHash(harness);
+  const scoutVersion = await readScoutVersion();
 
   // 3) 링크 수집 + 중복 제거 (같은 영상을 두 형태로 넣으면 요청 수가 두 배가 된다)
   /** @type {string[]} */
@@ -547,6 +683,12 @@ async function main() {
 
   // 7) 영상별 처리
   const summary = [];
+
+  // 배치 전체 진행률. 완료 청크를 세어서 아는 값이므로 추정이 섞이지 않는다.
+  // 1편·1청크뿐이면 바 하나가 통째로 노이즈라 생략한다.
+  const showBatchBar = batch.totalCalls > 1;
+  let doneChunks = 0;
+
   for (const [i, p] of batch.plans.entries()) {
     const meta = playable.find((m) => m.id === p.id);
     if (!meta) continue;
@@ -564,8 +706,13 @@ async function main() {
 
     const r = await runVideo({
       meta, ranges: p.ranges, apiKey, model, harness, harnessLabel,
-      chunk, outDir, pool,
+      chunk, outDir, pool, scoutVersion, harnessSha,
     });
+
+    doneChunks += r.merged.okChunks;
+    if (showBatchBar) {
+      log(`   진행: ${bar(doneChunks, batch.totalCalls)} ${doneChunks}/${batch.totalCalls} 청크`);
+    }
 
     summary.push({
       id: p.id,
