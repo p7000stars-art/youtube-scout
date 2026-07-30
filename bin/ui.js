@@ -56,6 +56,8 @@ export function displayWidth(s) {
  * @typedef {object} Spinner
  * @property {boolean} active         TTY라서 실제로 화면 한 줄을 점유했는가
  * @property {() => void} clear       점유한 줄을 비운다 (다른 출력이 끼어들 때)
+ * @property {() => void} pause       애니메이션을 멈추고 줄을 비운다 (다른 스피너에 줄을 넘길 때)
+ * @property {() => void} resume      pause 이후 다시 그리기 시작한다
  * @property {(finalText?: string) => void} done  애니메이션 종료 + 최종 줄 확정
  */
 
@@ -80,6 +82,8 @@ export function spinner(labelFn) {
     return {
       active: false,
       clear() {},
+      pause() {},
+      resume() {},
       done(finalText = '') {
         if (finalText) out.write(`${finalText}\n`);
       },
@@ -108,10 +112,23 @@ export function spinner(labelFn) {
 
   draw(); // 첫 프레임은 즉시 — 200ms 동안 아무것도 없으면 멈춘 것처럼 보인다
 
-  const timer = setInterval(draw, FRAME_MS);
-  // unref 필수. 이걸 빼면 인터벌이 이벤트 루프를 붙잡아 "작업이 끝나면 즉시 종료"
-  // 원칙이 깨진다 (사용자를 입력 대기로 붙잡지 않는다는 것과 같은 규칙).
+  /**
+   * unref 필수. 이걸 빼면 인터벌이 이벤트 루프를 붙잡아 "작업이 끝나면 즉시 종료"
+   * 원칙이 깨진다 (사용자를 입력 대기로 붙잡지 않는다는 것과 같은 규칙).
+   * @type {NodeJS.Timeout|null}
+   */
+  let timer = setInterval(draw, FRAME_MS);
   timer.unref();
+
+  /** done() 이후에는 resume으로 되살아나지 않아야 한다. */
+  let finished = false;
+
+  const stop = () => {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
 
   return {
     active: true,
@@ -120,8 +137,26 @@ export function spinner(labelFn) {
       // 복구 처리를 따로 하지 않는다 (자기 치유).
       erase();
     },
+    /**
+     * 줄을 다른 스피너에 넘긴다.
+     *
+     * clear()와 달리 인터벌까지 멈춘다. clear()만 하면 200ms 뒤 이 스피너가 같은 줄에
+     * 다시 그려서, 그 줄을 쓰고 있는 다른 스피너(대기 카운트다운)와 한 줄을 두고 다툰다 —
+     * 두 문장이 겹쳐 찍히는 결함이 여기서 나왔다.
+     */
+    pause() {
+      stop();
+      erase();
+    },
+    resume() {
+      if (finished || timer) return;
+      draw(); // 즉시 한 프레임 — 재개가 200ms 뒤에 보이면 멈춘 것처럼 읽힌다
+      timer = setInterval(draw, FRAME_MS);
+      timer.unref();
+    },
     done(finalText = '') {
-      clearInterval(timer);
+      finished = true;
+      stop();
       erase();
       if (finalText) out.write(`${finalText}\n`);
     },

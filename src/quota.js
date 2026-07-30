@@ -116,13 +116,27 @@ export class ModelPool {
     /** 퇴역(404) 모델. 내일도 안 된다 — RPD와 구분해 안내해야 한다 (실측 2026-07-30:
      *  /models 목록의 gemini-2.5-flash가 generateContent 404. 좀비 모델). @type {Set<string>} */
     this.dead = new Set();
+    /**
+     * 순간 한도(TPM)를 반복해서 맞은 모델. 세 집합을 따로 두는 이유는 **해법이 다르기 때문**이다.
+     *   exhausted(RPD) → 내일 재실행하면 풀린다
+     *   dead(404)      → 영구. 목록에서 빼는 것이 답이다
+     *   tpmBlocked     → 이 청크 크기에서는 안 맞는다. 청크를 줄이거나 그 모델을 빼야 한다
+     *
+     * 실측 2026-07-30: 구세대 모델의 분당 토큰 한도가 480초 청크 입력(약 14만 토큰)보다
+     * 작았다. 이런 **구조적 TPM**은 기다려도 통과하지 못한다 — 입력 크기가 한도를 넘는 것이라
+     * 시간이 해결해 주지 않는다. 그래서 재시도를 소진하면 대기가 아니라 모델을 바꿔야 한다.
+     * @type {Set<string>}
+     */
+    this.tpmBlocked = new Set();
     /** 영상 단위 순환 커서 */
     this.cursor = 0;
   }
 
   /** 아직 쓸 수 있는 모델 목록 */
   available() {
-    return this.models.filter((m) => !this.exhausted.has(m) && !this.dead.has(m));
+    return this.models.filter(
+      (m) => !this.exhausted.has(m) && !this.dead.has(m) && !this.tpmBlocked.has(m),
+    );
   }
 
   /** 전 모델이 RPD로 소진됐는가 (→ 잔여 영상은 이월) */
@@ -132,6 +146,7 @@ export class ModelPool {
 
   /**
    * 다음 영상에 배정할 모델. 소진된 모델은 건너뛴다.
+   * 순환(커서)인 이유: 영상을 모델에 골고루 흩어 놓아야 모델별 RPD를 합쳐 쓸 수 있다.
    * @returns {string|null} 전부 소진이면 null
    */
   assign() {
@@ -140,6 +155,19 @@ export class ModelPool {
     const model = usable[this.cursor % usable.length];
     this.cursor += 1;
     return model;
+  }
+
+  /**
+   * 교체용 대체 모델. **순환이 아니라 우선순위 순서로 고른다.**
+   *
+   * 영상 배정(assign)과 규칙이 다른 이유: 목록 순서는 우선순위이고, 꼬리에는 판독력이
+   * 검증되지 않은 신모델이 있다(models.js의 꼬리 편입). 교체 때 커서를 쓰면 검증된
+   * 앞쪽 모델이 멀쩡히 남아 있는데도 꼬리의 미검증 모델로 넘어갈 수 있다 —
+   * "검증 풀이 소진됐을 때만 꼬리를 쓴다"는 설계가 그 지점에서 무너진다.
+   * @returns {string|null}
+   */
+  nextAvailable() {
+    return this.available()[0] ?? null;
   }
 
   /**
@@ -152,7 +180,7 @@ export class ModelPool {
    */
   markExhausted(model) {
     this.exhausted.add(model);
-    return this.assign();
+    return this.nextAvailable();
   }
 
   /**
@@ -164,7 +192,21 @@ export class ModelPool {
    */
   markDead(model) {
     this.dead.add(model);
-    return this.assign();
+    return this.nextAvailable();
+  }
+
+  /**
+   * 순간 한도 반복 처리 후 대체 모델을 돌려준다.
+   *
+   * 같은 모델로 더 기다리는 것이 무의미하다고 판단된 시점에만 부른다. 구조적 TPM
+   * (모델의 분당 토큰 한도 < 청크 입력 크기)이면 재시도 횟수를 아무리 늘려도 통과하지
+   * 못하므로, 남은 방법은 다른 모델뿐이다.
+   * @param {string} model
+   * @returns {string|null}
+   */
+  markTpmBlocked(model) {
+    this.tpmBlocked.add(model);
+    return this.nextAvailable();
   }
 }
 

@@ -21,16 +21,8 @@ import {
   DEFAULT_OVERLAP_SEC,
   DEFAULT_DAILY_LIMIT,
 } from '../src/plan.js';
-import { extractChunk, ExtractError, TEMPERATURE } from '../src/extract.js';
-import {
-  parse429,
-  quotaMessage,
-  forbiddenMessage,
-  ModelPool,
-  sleep,
-  MAX_RETRIES,
-  CALL_INTERVAL_MS,
-} from '../src/quota.js';
+import { TEMPERATURE } from '../src/extract.js';
+import { ModelPool, sleep, CALL_INTERVAL_MS } from '../src/quota.js';
 import {
   segFileName,
   segDocument,
@@ -45,6 +37,7 @@ import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
 import { spinner, bar, fmtSec } from './ui.js';
+import { runChunk } from './chunk-runner.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
@@ -144,6 +137,13 @@ async function waitVisible(ms, label) {
     await sleep(ms);
     return;
   }
+
+  // 대기는 추출 중에 일어난다 — 그때 청크 스피너가 이미 이 줄을 돌리고 있다.
+  // clear()만 하면 200ms 뒤 청크 스피너가 같은 줄에 다시 그려서 카운트다운과 겹쳐 찍힌다.
+  // 그래서 인터벌까지 멈추고(pause) 줄을 넘겨받은 뒤, 대기가 끝나면 되돌린다.
+  const outer = activeSpinner;
+  outer?.pause();
+
   const until = Date.now() + ms;
   // 프레임 문자를 쓰지 않는다 — 남은 시간이 줄어드는 것 자체가 살아있다는 신호다.
   const sp = spinner(() => `   ${label} ${fmtSec(Math.max(0, until - Date.now()))} 남음`);
@@ -152,7 +152,8 @@ async function waitVisible(ms, label) {
     await sleep(ms);
   } finally {
     sp.done(''); // 줄을 지우고 아무것도 남기지 않는다
-    activeSpinner = null;
+    activeSpinner = outer;
+    outer?.resume();
   }
 }
 
@@ -188,87 +189,6 @@ async function confirm(question) {
     return answer === 'y' || answer === 'yes';
   } finally {
     rl.close();
-  }
-}
-
-// ── 한 구간 처리 ────────────────────────────────────────────────────
-/**
- * 구간 하나를 추출한다. 재시도·모델 교체 판단까지 담당하고,
- * RPD를 만나면 재시도하지 않고 곧바로 신호를 올린다.
- *
- * @param {{
- *   apiKey: string, model: string, id: string, url: string,
- *   start: number, end: number, harness: string, pool: ModelPool
- * }} p
- * @returns {Promise<{ ok: true, text: string, tokens: number, model: string }
- *                  | { ok: false, daily: boolean, reason: string, model: string }>}
- */
-async function runChunk(p) {
-  let model = p.model;
-
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      const r = await extractChunk({
-        apiKey: p.apiKey,
-        model,
-        id: p.id,
-        start: p.start,
-        end: p.end,
-        harness: p.harness,
-      });
-      return { ok: true, text: r.text, tokens: r.tokens, model };
-    } catch (e) {
-      if (!(e instanceof ExtractError)) {
-        return { ok: false, daily: false, reason: e instanceof Error ? e.message : String(e), model };
-      }
-
-      if (e.status === 429) {
-        const info = parse429(e.body);
-        log(`      ${quotaMessage(info, model)}`);
-
-        if (info.isDaily) {
-          // 실측: RPD는 대기해도 안 풀린다 → 즉시 모델 교체. 재시도하지 않는다.
-          const next = p.pool.markExhausted(model);
-          if (!next) return { ok: false, daily: true, reason: 'RPD (전 모델 소진)', model };
-          log(`      모델 교체: ${model} → ${next}`);
-          model = next;
-          continue; // 교체는 재시도 횟수에 세지 않는다. 다른 모델의 첫 시도다.
-        }
-
-        if (attempt > MAX_RETRIES) {
-          return { ok: false, daily: false, reason: `429 재시도 ${MAX_RETRIES}회 초과`, model };
-        }
-        await waitVisible(info.waitMs, 'TPM 회복 대기 중...');
-        continue;
-      }
-
-      if (e.status === 404) {
-        // 좀비 모델 (실측 2026-07-30): /v1beta/models 목록에는 있는데 generateContent가
-        // 404를 돌려주는 퇴역 모델이 존재한다 (gemini-2.5-flash — 텍스트 요청에도 404).
-        // 이 키에서는 영구 실패이므로 재시도가 무의미하다 → RPD와 동일하게 즉시 교체.
-        // 404는 쿼터를 소모하지 않으므로 좀비가 몇 개든 각 1회 헛손질로 끝난다.
-        log(`      404 — 모델 '${model}'은(는) 목록에는 있으나 실사용이 불가하다 (퇴역 추정). 제외한다.`);
-        const next = p.pool.markDead(model);
-        if (!next) return { ok: false, daily: false, reason: '404 (사용 가능한 모델 없음)', model };
-        log(`      모델 교체: ${model} → ${next}`);
-        model = next;
-        continue; // 교체는 재시도 횟수에 세지 않는다. 다른 모델의 첫 시도다.
-      }
-
-      if (e.status === 403) {
-        return { ok: false, daily: false, reason: forbiddenMessage(), model };
-      }
-
-      // 5xx는 일시적 혼잡일 수 있다. 429와 같은 상한 안에서만 재시도한다.
-      if (e.status >= 500 && attempt <= MAX_RETRIES) {
-        const wait = Math.min(attempt * 10_000, 90_000);
-        log(`      HTTP ${e.status} — ${wait / 1000}초 후 재시도 (${attempt}/${MAX_RETRIES})`);
-        await waitVisible(wait, '서버 혼잡 대기 중...');
-        continue;
-      }
-
-      return { ok: false, daily: false, reason: e.message, model };
-    }
   }
 }
 
@@ -408,11 +328,21 @@ async function runVideo(p) {
     // "죽었다"로 읽는다(실사용 피드백 2026-07-30). TTY에서는 시작 줄을 스피너로 잡아
     // 경과 시간을 갱신하고, 완료되면 그 줄을 결과 줄로 확정한다.
     // 非TTY(파이프·리다이렉트)에서는 예전처럼 시작 줄을 그냥 한 줄 출력한다.
-    const startLine = stamp(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${model})`);
+    // 시각과 본문을 따로 잡는다. 시각은 시작 시점으로 고정하고, 본문은 매 프레임 다시
+    // 만든다 — 모델이 교체되면 스피너가 새 모델명을 보여줘야 하기 때문이다.
+    // (이전에는 시작 줄 문자열을 그대로 재사용해 교체 후에도 옛 모델명이 남아 있었다.)
+    const prefix = stamp('');
+    const body = /** @param {string} m */ (m) =>
+      `   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${m})`;
+
+    let shownModel = model;
+    const startLine = `${prefix}${body(model)}`;
     logFile(startLine); // 로그 파일에는 시작 줄이 항상 남는다 (화면 표현과 무관하게)
 
     const t0 = Date.now();
-    const sp = spinner((frame) => `${startLine} ${frame} ${fmtSec(Date.now() - t0)}`);
+    const sp = spinner(
+      (frame) => `${prefix}${body(shownModel)} ${frame} ${fmtSec(Date.now() - t0)}`,
+    );
     activeSpinner = sp.active ? sp : null;
     if (!sp.active) console.log(startLine);
 
@@ -422,6 +352,11 @@ async function runVideo(p) {
       res = await runChunk({
         apiKey: p.apiKey, model, id: p.meta.id, url: p.meta.url,
         start: r.start, end: r.end, harness: p.harness, pool: p.pool,
+        log,
+        wait: waitVisible,
+        onModelChange: (m) => {
+          shownModel = m;
+        },
       });
     } finally {
       activeSpinner = null;
@@ -449,10 +384,15 @@ async function runVideo(p) {
       const line = stamp(`      실패: ${res.reason} (${took})`);
       sp.done(line);
       logFile(line);
-      if (res.daily) {
-        // 전 모델 RPD 소진. 남은 구간은 다음 실행으로 이월된다.
+      if (res.poolEmpty) {
+        // 쓸 수 있는 모델이 하나도 남지 않았다. 남은 구간을 계속 시도해도 같은 결과이므로
+        // 헛손질을 하지 않고 다음 실행으로 이월한다.
         carriedOver = true;
-        log('      전 모델 일일 한도 소진 — 남은 구간은 다음 실행으로 이월한다');
+        log(
+          res.daily
+            ? '      전 모델 일일 한도 소진 — 남은 구간은 다음 실행으로 이월한다'
+            : '      사용 가능한 모델이 없다 — 남은 구간은 다음 실행으로 이월한다',
+        );
         break;
       }
       model = res.model;
@@ -739,6 +679,15 @@ async function main() {
   if (pool.dead.size) {
     // 퇴역은 RPD와 해법이 다르다 — 내일도 안 된다. run 파일/--models에서 빼는 게 답이다.
     show(`  퇴역(404) 모델: ${[...pool.dead].join(', ')} — 내일도 사용 불가. --models 또는 run 파일에서 제거를 권장한다`);
+  }
+  if (pool.tpmBlocked.size) {
+    // 세 번째 해법이다. RPD는 내일, 퇴역은 제거, 이건 청크 축소.
+    // 뭉쳐서 안내하면 사용자가 엉뚱한 조치를 한다.
+    show(
+      `  순간 한도 반복으로 제외된 모델: ${[...pool.tpmBlocked].join(', ')} — ` +
+      `이 모델의 분당 토큰 한도가 현재 청크(${chunk}초)를 받아내지 못한다. ` +
+      `--chunk 를 줄이면 쓸 수 있다`,
+    );
   }
   show(`  산출물: ${outDir}`);
   show(`  로그:   ${logPath}`);
