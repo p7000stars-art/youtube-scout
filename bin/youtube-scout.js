@@ -21,7 +21,7 @@ import {
   DEFAULT_OVERLAP_SEC,
   DEFAULT_DAILY_LIMIT,
 } from '../src/plan.js';
-import { extractChunk, ExtractError } from '../src/extract.js';
+import { extractChunk, ExtractError, TEMPERATURE } from '../src/extract.js';
 import {
   parse429,
   quotaMessage,
@@ -31,7 +31,7 @@ import {
   MAX_RETRIES,
   CALL_INTERVAL_MS,
 } from '../src/quota.js';
-import { segFileName, segDocument, harnessName, today } from '../src/output.js';
+import { segFileName, segDocument, harnessName, harnessHash, today } from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
@@ -39,6 +39,21 @@ import { spinner, bar, fmtSec } from './ui.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
+
+/**
+ * 자기 package.json 경로. 버전을 산출물에 각인하려면 어디선가 읽어야 하는데,
+ * src/가 저장소 구조를 알면 껍데기 교체 시 같이 깨진다. 그래서 껍데기가 읽어 인자로 넘긴다.
+ */
+const PKG_PATH = resolve(HERE, '../package.json');
+
+/** @returns {Promise<string>} 읽지 못해도 실행을 막지 않는다 — 각인은 보조 정보다. */
+async function readScoutVersion() {
+  try {
+    return String(JSON.parse(await readFile(PKG_PATH, 'utf8')).version ?? 'unknown');
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** 기본 모델. 단일이다 — 모델을 늘리는 것은 쿼터를 늘리는 선택이라 사용자가 정한다. */
 const DEFAULT_MODELS = 'gemini-3.6-flash';
@@ -320,7 +335,8 @@ async function runInit(p) {
  *   meta: import('../src/meta.js').VideoMeta,
  *   ranges: { start: number, end: number }[],
  *   apiKey: string, model: string, harness: string, harnessLabel: string,
- *   chunk: number, outDir: string, pool: ModelPool
+ *   chunk: number, outDir: string, pool: ModelPool,
+ *   scoutVersion: string, harnessSha: string
  * }} p
  */
 async function runVideo(p) {
@@ -420,6 +436,11 @@ async function runVideo(p) {
       okChunks: 0,
       totalChunks: p.ranges.length,
       extracted: today(),
+      // 재현 각인. 하네스는 이름(harness)과 내용 해시(harnessSha) 둘 다 남는다 —
+      // 이름은 사람이 읽고, 해시는 변조를 잡는다.
+      harnessSha: p.harnessSha,
+      scoutVersion: p.scoutVersion,
+      temperature: TEMPERATURE,
     },
   });
 
@@ -511,6 +532,10 @@ async function main() {
     return 1;
   }
   const harnessLabel = harnessName(harnessPath);
+  // 이름이 아니라 내용으로 각인한다 — meeting-v1.md를 고치고 이름을 그대로 두면
+  // 변조된 규율의 보고서가 원본과 구분되지 않는다.
+  const harnessSha = harnessHash(harness);
+  const scoutVersion = await readScoutVersion();
 
   // 3) 링크 수집 + 중복 제거 (같은 영상을 두 형태로 넣으면 요청 수가 두 배가 된다)
   /** @type {string[]} */
@@ -639,7 +664,7 @@ async function main() {
 
     const r = await runVideo({
       meta, ranges: p.ranges, apiKey, model, harness, harnessLabel,
-      chunk, outDir, pool,
+      chunk, outDir, pool, scoutVersion, harnessSha,
     });
 
     doneChunks += r.merged.okChunks;

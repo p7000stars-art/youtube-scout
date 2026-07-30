@@ -26,6 +26,10 @@ const META = {
   okChunks: 0,
   totalChunks: 0,
   extracted: '2026-07-29',
+  // 재현 각인 (bin이 실제로 넘기는 값들)
+  harnessSha: 'abc123def456',
+  scoutVersion: '0.2.0',
+  temperature: 0.1,
 };
 
 async function makeDir() {
@@ -97,6 +101,11 @@ test('전 구간 정상이면 ⛔ 없이 frontmatter와 미검증 배너가 들�
   assert.match(text, /미검증\*\* 상태다/);
   // 제목의 쌍따옴표는 홑따옴표로 치환된다
   assert.match(text, /^title: "Demo 'video'"$/m);
+  // 재현 각인이 실제 파일까지 도달한다
+  assert.match(text, /^harness_sha256: abc123def456$/m);
+  assert.match(text, /^scout_version: 0\.2\.0$/m);
+  assert.match(text, /^temperature: 0\.1$/m);
+  assert.doesNotMatch(text, /undefined/);
   // 구간 본문은 순서대로
   assert.ok(text.indexOf('본문 0') < text.indexOf('본문 475'));
   assert.ok(text.indexOf('본문 475') < text.indexOf('본문 950'));
