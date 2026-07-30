@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { mergeVideo, buildMerged, findStrays, MERGED_NAME } from '../src/merge.js';
-import { segFileName } from '../src/output.js';
+import { segFileName, PARTS_DIR, LEGACY_MERGED_NAME } from '../src/output.js';
 
 /** 계획 3구간 (1900초 / 청크 720 / 겹침 5 가정이 아니라 테스트용 고정값) */
 const RANGES = [
@@ -131,17 +131,113 @@ test('빈 파일도 실패로 취급한다 (빈 구간이 조용히 통과하지
   assert.equal(r.okChunks, 2);
 });
 
-test('_merged.md 쓰기 실패 시 대체 파일명으로 저장한다 (작업이 마지막 줄에서 날아가지 않게)', async () => {
+test('최종본 쓰기 실패 시 대체 파일명으로 저장한다 (작업이 마지막 줄에서 날아가지 않게)', async () => {
   const dir = await makeDir();
   await writeFile(join(dir, segFileName(0, 480)), '본문');
 
-  // 쓰기 불가 상태를 만든다: _merged.md 자리에 디렉터리를 놓아 writeFile을 실패시킨다
+  // 쓰기 불가 상태를 만든다: 최종본 자리에 디렉터리를 놓아 writeFile을 실패시킨다
   await mkdir(join(dir, MERGED_NAME));
 
   const r = await mergeVideo({ dir, meta: META, ranges: [{ start: 0, end: 480 }], url: META.url });
   assert.equal(r.fallback, true);
-  assert.match(r.path, /_merged-\d{4}-\d{6}\.md$/);
+  assert.match(r.path, /보고서-\d{4}-\d{6}\.md$/);
   assert.match(await readFile(r.path, 'utf8'), /본문/);
+});
+
+// ── 새 폴더 구조 (C-2 / C-3) ────────────────────────────────────────
+
+test('최종본 이름은 보고서.md다 (_merged는 내부 사정의 이름이었다)', async () => {
+  const dir = await makeDir();
+  await writeFile(join(dir, segFileName(0, 480)), '본문');
+  const r = await mergeVideo({ dir, meta: META, ranges: [{ start: 0, end: 480 }], url: META.url });
+  assert.equal(MERGED_NAME, '보고서.md');
+  assert.ok(r.path.endsWith('보고서.md'));
+});
+
+test('구간을 parts 하위에서 읽는다', async () => {
+  const dir = await makeDir();
+  const parts = join(dir, PARTS_DIR);
+  await mkdir(parts);
+  for (const r of RANGES) await writeFile(join(parts, segFileName(r.start, r.end)), `본문 ${r.start}`);
+
+  const res = await mergeVideo({
+    dir, segDirs: [parts, dir], meta: META, ranges: RANGES, url: META.url,
+  });
+  const text = await readFile(res.path, 'utf8');
+  assert.equal(res.okChunks, 3);
+  assert.deepEqual(res.missing, []);
+  assert.doesNotMatch(text, /⛔/);
+  // 최종본은 폴더 최상위 (parts 안이 아니다)
+  assert.equal(res.path, join(dir, MERGED_NAME));
+});
+
+test('구형 배치(폴더 최상위)의 구간도 읽는다 — 재개를 깨지 않는다', async () => {
+  const dir = await makeDir();
+  const parts = join(dir, PARTS_DIR);
+  await mkdir(parts);
+  // 이전 버전이 최상위에 남긴 구간 2개 + 이번 실행이 parts에 쓴 구간 1개
+  await writeFile(join(dir, segFileName(0, 480)), '구형 본문 0');
+  await writeFile(join(dir, segFileName(475, 955)), '구형 본문 475');
+  await writeFile(join(parts, segFileName(950, 1200)), '신형 본문 950');
+
+  const res = await mergeVideo({
+    dir, segDirs: [parts, dir], meta: META, ranges: RANGES, url: META.url,
+  });
+  const text = await readFile(res.path, 'utf8');
+  assert.equal(res.okChunks, 3, '구형 2개 + 신형 1개가 모두 인식된다');
+  assert.doesNotMatch(text, /⛔/);
+  assert.ok(text.includes('구형 본문 0') && text.includes('신형 본문 950'));
+});
+
+test('같은 구간이 양쪽에 있으면 parts 쪽이 우선한다', async () => {
+  const dir = await makeDir();
+  const parts = join(dir, PARTS_DIR);
+  await mkdir(parts);
+  await writeFile(join(dir, segFileName(0, 480)), '구형 본문');
+  await writeFile(join(parts, segFileName(0, 480)), '신형 본문');
+
+  const res = await mergeVideo({
+    dir, segDirs: [parts, dir], meta: META, ranges: [{ start: 0, end: 480 }], url: META.url,
+  });
+  const text = await readFile(res.path, 'utf8');
+  assert.ok(text.includes('신형 본문'));
+  assert.ok(!text.includes('구형 본문'));
+});
+
+test('구형 _merged.md를 잔여 파일로 신고하지 않는다 (거짓 경고 방지)', async () => {
+  // 이전 산출물이 있는 사용자는 매 실행마다 이 경고를 보게 된다 — 그건 노이즈다.
+  const dir = await makeDir();
+  const parts = join(dir, PARTS_DIR);
+  await mkdir(parts);
+  await writeFile(join(dir, LEGACY_MERGED_NAME), '이전 병합본');
+  await writeFile(join(parts, segFileName(0, 480)), '본문');
+
+  const res = await mergeVideo({
+    dir, segDirs: [parts, dir], meta: META, ranges: [{ start: 0, end: 480 }], url: META.url,
+  });
+  assert.deepEqual(res.strays, []);
+  // 구형 병합본은 건드리지 않는다
+  assert.equal(await readFile(join(dir, LEGACY_MERGED_NAME), 'utf8'), '이전 병합본');
+});
+
+test('최종본 자신도 잔여가 아니다 (두 번째 실행에서 자기를 신고하면 안 된다)', () => {
+  const entries = [segFileName(0, 480), MERGED_NAME, '보고서-0730-142530.md', LEGACY_MERGED_NAME, 'stray.md'];
+  assert.deepEqual(findStrays(entries, [{ start: 0, end: 480 }]), ['stray.md']);
+});
+
+test('잔여 파일은 parts와 최상위 양쪽에서 찾고 중복은 한 번만 알린다', async () => {
+  const dir = await makeDir();
+  const parts = join(dir, PARTS_DIR);
+  await mkdir(parts);
+  await writeFile(join(parts, segFileName(0, 480)), '본문');
+  // 같은 이름의 잔여가 양쪽에 하나씩
+  await writeFile(join(dir, segFileName(0, 240)), '구형 잔여');
+  await writeFile(join(parts, segFileName(0, 240)), '신형 잔여');
+
+  const res = await mergeVideo({
+    dir, segDirs: [parts, dir], meta: META, ranges: [{ start: 0, end: 480 }], url: META.url,
+  });
+  assert.deepEqual(res.strays, [segFileName(0, 240)], '중복 신고 없음');
 });
 
 test('buildMerged는 계획 순서를 그대로 따른다 (디렉터리 나열 순서에 의존하지 않는다)', () => {

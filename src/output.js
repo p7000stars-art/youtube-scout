@@ -54,6 +54,99 @@ export const UNVERIFIED_BANNER = [
 /** 추출에 실패한 구간에 삽입하는 표식. 누락이 침묵하지 않게 한다. */
 export const MISSING_MARK = '> ⛔ **이 구간은 추출에 실패했습니다.** 내용이 통째로 비어 있습니다.';
 
+/** 병합 최종본의 파일명. "_merged"는 내부 사정의 이름이고, 사용자에게의 정체는 보고서다. */
+export const REPORT_NAME = '보고서.md';
+
+/** 구간 파일을 모아 두는 하위 폴더. 최종본만 최상위에 남겨 무엇을 열지 구조가 말하게 한다. */
+export const PARTS_DIR = 'parts';
+
+/** 구형 배치의 병합본 이름. 읽지도 지우지도 않지만 잔여 파일로 오인하지 않으려면 알아야 한다. */
+export const LEGACY_MERGED_NAME = '_merged.md';
+
+/**
+ * 폴더명에 쓸 제목 최대 길이.
+ * Windows 경로 상한이 260자인데 사용자는 깊은 경로(바탕화면\작업\2026\...)에서 실행한다.
+ * 제목을 통째로 쓰면 `parts\seg-0475-0955.md`까지 붙는 순간 상한을 넘겨 쓰기가 실패한다.
+ */
+export const FOLDER_TITLE_MAX = 60;
+
+/**
+ * 영상 제목을 폴더명으로 쓸 수 있게 정제한다.
+ *
+ * Windows가 거부하는 것들을 없애는 것이 목적이다. macOS·Linux는 `/`만 막지만,
+ * 산출물 폴더를 통째로 주고받는 사용법을 전제하면 가장 좁은 규칙에 맞춰야 한다.
+ *
+ * @param {string} title
+ * @returns {string} 정제된 제목. 전부 걸러지면 빈 문자열
+ */
+export function sanitizeForFolder(title) {
+  let s = String(title ?? '');
+
+  // Windows 예약 문자와 제어문자를 공백으로. 삭제가 아니라 치환인 이유는
+  // "A/B"가 "AB"로 붙어 다른 낱말이 되는 것을 막기 위해서다.
+  s = s.replace(/[\\/:*?"<>|]/g, ' ').replace(/[\u0000-\u001f\u007f]/g, ' ');
+
+  // 치환으로 생긴 연속 공백을 하나로
+  s = s.replace(/\s+/g, ' ').trim();
+
+  // 절단은 압축 뒤에 한다 — 공백이 압축되기 전에 자르면 실제 글자 수가 줄어든다.
+  if (s.length > FOLDER_TITLE_MAX) s = s.slice(0, FOLDER_TITLE_MAX);
+
+  // 끝 마침표·공백 제거는 **절단 뒤에** 다시 해야 한다.
+  // Windows는 끝이 마침표나 공백인 폴더를 만들지 못하고, 절단이 하필 그런 끝을 만들 수 있다.
+  s = s.replace(/^[\s.]+/, '').replace(/[\s.]+$/, '');
+
+  return s;
+}
+
+/**
+ * 영상 폴더명: `<정제한 제목>_<영상ID>`
+ *
+ * ## 왜 제목 단독이 아니고 ID를 반드시 붙이는가
+ * 1. **제목은 가변이다.** 유튜버가 제목을 고치면 다음 실행의 폴더명이 달라진다. 그러면
+ *    재개가 이전 폴더를 찾지 못해 이미 뽑아 둔 구간을 처음부터 다시 뽑는다 — 한도 20회
+ *    환경에서 그것은 곧 실패다. ID는 불변이라 재개 앵커가 될 수 있다.
+ * 2. **충돌 방지.** 제목이 같은 영상이 여럿 있을 수 있고(재업로드·시리즈), 제목만 쓰면
+ *    서로 다른 영상의 산출물이 한 폴더에 섞인다.
+ *
+ * 덤으로: 이름 끝에 항상 `_<ID>`가 붙으므로 Windows 예약 이름(CON, PRN, NUL, COM1...)과
+ * 정확히 같아지는 경우가 없다.
+ *
+ * @param {string} title
+ * @param {string} id
+ */
+export function videoFolderName(title, id) {
+  const clean = sanitizeForFolder(title);
+  // 제목이 전부 걸러졌으면(기호만으로 된 제목 등) ID 단독으로 폴백한다.
+  return clean ? `${clean}_${id}` : id;
+}
+
+/**
+ * 기존 산출물 폴더를 찾는다. **디렉터리 나열은 호출자(bin)가 하고 판정만 여기서 한다**
+ * (코어는 파일시스템을 모른다는 규칙).
+ *
+ * ## 왜 찾아서 재사용하는가
+ * 제목이 바뀌었다고 새 폴더를 만들면 이미 완료한 구간이 이전 폴더에 고립되고, 재개가
+ * 무의미해진다. 그래서 폴더명 갱신보다 **재개를 우선**한다 — 한 번 정해진 폴더는 그대로 쓴다.
+ *
+ * @param {string[]} entries out 아래 디렉터리 이름 목록
+ * @param {string} id 11자 영상 ID
+ * @returns {string|null} 재사용할 폴더 이름. 없으면 null
+ */
+export function matchVideoFolder(entries, id) {
+  const list = (entries ?? []).filter(Boolean);
+
+  // 구형(ID 단독)을 먼저 본다. 이 폴더가 이 도구의 이전 버전이 남긴 산출물이고,
+  // 놓치면 사용자의 완료분이 고립된다.
+  if (list.includes(id)) return id;
+
+  // 신형: `_<ID>`로 끝난다. 제목이 바뀌어 여러 개가 생긴 경우에도 결과가 흔들리지 않게
+  // 정렬해 첫 번째를 고른다(같은 입력이면 같은 폴더를 고른다).
+  const suffix = `_${id}`;
+  const matches = list.filter((name) => name.endsWith(suffix)).sort();
+  return matches[0] ?? null;
+}
+
 /**
  * 초를 4자리 제로패딩 문자열로. 4자리를 넘는 긴 영상은 자연스럽게 자릿수가 늘어난다
  * (자르면 서로 다른 구간이 같은 파일명을 갖게 된다).
@@ -199,8 +292,9 @@ export function buildMergedDocument(meta, sections) {
 }
 
 /**
- * `_merged.md` 쓰기가 실패했을 때 쓸 대체 파일명. 예: `_merged-0730-142530.md`
+ * 최종본 쓰기가 실패했을 때 쓸 대체 파일명. 예: `보고서-0730-142530.md`
  * 다청크 작업이 마지막 한 줄(파일 잠금)에서 통째로 날아가지 않게 한다.
+ * 최종본과 같은 접두를 쓴다 — 잔여 파일 판정이 접두로 걸러내기 때문이다.
  * @param {Date} [d]
  */
 export function fallbackMergedName(d = new Date()) {
@@ -208,7 +302,7 @@ export function fallbackMergedName(d = new Date()) {
   const stamp =
     `${p(d.getMonth() + 1)}${p(d.getDate())}-` +
     `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  return `_merged-${stamp}.md`;
+  return `${REPORT_NAME.replace(/\.md$/, '')}-${stamp}.md`;
 }
 
 /**

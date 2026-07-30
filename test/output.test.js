@@ -10,9 +10,16 @@ import {
   segFileName,
   segHeader,
   harnessName,
+  sanitizeForFolder,
+  videoFolderName,
+  matchVideoFolder,
+  fallbackMergedName,
   MEDIA_RESOLUTION,
   HARNESS_SHA_LEN,
   UNVERIFIED_BANNER,
+  FOLDER_TITLE_MAX,
+  REPORT_NAME,
+  PARTS_DIR,
 } from '../src/output.js';
 
 /** frontmatter 인자 한 벌. 신규 필드까지 포함한다. */
@@ -182,4 +189,141 @@ test('구간 파일명과 헤더는 그대로다', () => {
     segHeader({ start: 475, end: 955, chunk: 480, model: 'gemini-3.6-flash' }),
     '<!-- seg-0475-0955.md | 475s-955s | chunk=480s | gemini-3.6-flash -->',
   );
+});
+
+// ── 폴더명 정제 (C-1) ───────────────────────────────────────────────
+
+test('Windows 금지 문자는 공백으로 치환된다 (삭제하면 낱말이 붙어 버린다)', () => {
+  assert.equal(sanitizeForFolder('A/B'), 'A B');
+  assert.equal(sanitizeForFolder('a\\b:c*d?e"f<g>h|i'), 'a b c d e f g h i');
+});
+
+test('연속 공백은 하나로 압축된다', () => {
+  assert.equal(sanitizeForFolder('A   B'), 'A B');
+  assert.equal(sanitizeForFolder('A//B'), 'A B'); // 치환으로 생긴 연속 공백
+  assert.equal(sanitizeForFolder('A\t\nB'), 'A B');
+});
+
+test('앞뒤 공백과 마침표가 제거된다 (Windows는 그런 폴더를 만들지 못한다)', () => {
+  assert.equal(sanitizeForFolder('  제목  '), '제목');
+  assert.equal(sanitizeForFolder('제목...'), '제목');
+  assert.equal(sanitizeForFolder('...제목'), '제목');
+  assert.equal(sanitizeForFolder('제목. '), '제목');
+});
+
+test(`제목은 ${FOLDER_TITLE_MAX}자에서 절단된다 (Windows 260자 경로 상한 대비)`, () => {
+  const long = '가'.repeat(200);
+  assert.equal(sanitizeForFolder(long).length, FOLDER_TITLE_MAX);
+});
+
+test('절단이 끝에 마침표를 남기면 그것도 제거된다 (순서가 중요하다)', () => {
+  // 60자 경계에 하필 마침표가 오는 제목. 절단 → 끝 마침표 제거 순서가 아니면 남는다.
+  const title = `${'가'.repeat(59)}...뒤쪽은 잘린다`;
+  const out = sanitizeForFolder(title);
+  assert.ok(!out.endsWith('.'), `끝이 마침표다: ${JSON.stringify(out)}`);
+  assert.ok(!out.endsWith(' '));
+});
+
+test('제어문자는 제거된다', () => {
+  assert.equal(sanitizeForFolder('\u0000제\u001f 목\u007f끝'), '제 목 끝');
+});
+
+test('실제 제목 형태가 그대로 살아남는다 (괄호·느낌표는 금지 문자가 아니다)', () => {
+  assert.equal(
+    sanitizeForFolder('클로드 디자인 2.0 완전히 달라졌습니다 (4단계 총정리)'),
+    '클로드 디자인 2.0 완전히 달라졌습니다 (4단계 총정리)',
+  );
+});
+
+test('정제 결과가 비면 빈 문자열이다', () => {
+  assert.equal(sanitizeForFolder('///'), '');
+  assert.equal(sanitizeForFolder('   '), '');
+  assert.equal(sanitizeForFolder('...'), '');
+  assert.equal(sanitizeForFolder(''), '');
+  // @ts-expect-error 의도적으로 잘못된 타입
+  assert.equal(sanitizeForFolder(null), '');
+});
+
+// ── 폴더명 생성 (C-1) ───────────────────────────────────────────────
+
+test('폴더명은 <제목>_<ID> 형식이다', () => {
+  assert.equal(
+    videoFolderName('클로드 디자인 2.0 완전히 달라졌습니다 (4단계 총정리)', 'c-ny7pegVHI'),
+    '클로드 디자인 2.0 완전히 달라졌습니다 (4단계 총정리)_c-ny7pegVHI',
+  );
+});
+
+test('ID는 반드시 접미로 남는다 (제목은 가변이라 재개 앵커가 못 된다)', () => {
+  for (const title of ['제목', 'A/B', '가'.repeat(200), '느낌표!']) {
+    assert.ok(videoFolderName(title, 'c-ny7pegVHI').endsWith('_c-ny7pegVHI'), title.slice(0, 10));
+  }
+});
+
+test('제목이 전부 걸러지면 ID 단독으로 폴백한다', () => {
+  assert.equal(videoFolderName('///', 'c-ny7pegVHI'), 'c-ny7pegVHI');
+  assert.equal(videoFolderName('', 'c-ny7pegVHI'), 'c-ny7pegVHI');
+});
+
+test('폴더명에 Windows 금지 문자가 남지 않는다', () => {
+  const name = videoFolderName('a\\b/c:d*e?f"g<h>i|j', 'c-ny7pegVHI');
+  assert.doesNotMatch(name, /[\\/:*?"<>|]/);
+});
+
+// ── 기존 폴더 인식 (C-3) ────────────────────────────────────────────
+
+test('구형 ID 단독 폴더를 인식한다 (이전 버전 산출물을 고립시키지 않는다)', () => {
+  assert.equal(matchVideoFolder(['c-ny7pegVHI', 'other'], 'c-ny7pegVHI'), 'c-ny7pegVHI');
+});
+
+test('신형 _<ID> 접미 폴더를 인식한다', () => {
+  assert.equal(
+    matchVideoFolder(['어떤 제목_c-ny7pegVHI', 'other_xxxxxxxxxxx'], 'c-ny7pegVHI'),
+    '어떤 제목_c-ny7pegVHI',
+  );
+});
+
+test('제목이 바뀌어도 기존 폴더를 재사용한다 (폴더명 갱신보다 재개가 우선)', () => {
+  // 유튜버가 제목을 고친 상황: 폴더에는 옛 제목이 남아 있다.
+  const found = matchVideoFolder(['옛 제목_c-ny7pegVHI'], 'c-ny7pegVHI');
+  assert.equal(found, '옛 제목_c-ny7pegVHI');
+  assert.notEqual(found, videoFolderName('새 제목', 'c-ny7pegVHI'));
+});
+
+test('구형과 신형이 함께 있으면 구형을 고른다 (완료분이 그쪽에 있다)', () => {
+  assert.equal(
+    matchVideoFolder(['c-ny7pegVHI', '제목_c-ny7pegVHI'], 'c-ny7pegVHI'),
+    'c-ny7pegVHI',
+  );
+});
+
+test('신형이 여러 개면 정렬해 결정적으로 고른다 (같은 입력 → 같은 폴더)', () => {
+  const entries = ['B제목_c-ny7pegVHI', 'A제목_c-ny7pegVHI'];
+  assert.equal(matchVideoFolder(entries, 'c-ny7pegVHI'), 'A제목_c-ny7pegVHI');
+  assert.equal(matchVideoFolder([...entries].reverse(), 'c-ny7pegVHI'), 'A제목_c-ny7pegVHI');
+});
+
+test('없으면 null (호출자가 새로 만든다)', () => {
+  assert.equal(matchVideoFolder([], 'c-ny7pegVHI'), null);
+  assert.equal(matchVideoFolder(['다른 영상_xxxxxxxxxxx'], 'c-ny7pegVHI'), null);
+  // @ts-expect-error 의도적으로 잘못된 타입
+  assert.equal(matchVideoFolder(null, 'c-ny7pegVHI'), null);
+});
+
+test('ID가 우연히 이름 안에 있어도 접미가 아니면 매치되지 않는다', () => {
+  // `_<ID>`로 끝나야 한다. 제목에 ID 문자열이 섞인 폴더를 잘못 집으면 산출물이 섞인다.
+  assert.equal(matchVideoFolder(['c-ny7pegVHI_어떤제목'], 'c-ny7pegVHI'), null);
+  assert.equal(matchVideoFolder(['제목 c-ny7pegVHI 중간'], 'c-ny7pegVHI'), null);
+});
+
+// ── 최종본 이름 (C-2) ───────────────────────────────────────────────
+
+test('최종본 이름은 보고서.md, 구간은 parts 하위다', () => {
+  assert.equal(REPORT_NAME, '보고서.md');
+  assert.equal(PARTS_DIR, 'parts');
+});
+
+test('대체 파일명은 최종본과 같은 접두를 쓴다 (잔여 판정이 접두로 걸러낸다)', () => {
+  const alt = fallbackMergedName(new Date(2026, 6, 30, 14, 25, 30));
+  assert.equal(alt, '보고서-0730-142530.md');
+  assert.ok(alt.startsWith(REPORT_NAME.replace(/\.md$/, '')));
 });
