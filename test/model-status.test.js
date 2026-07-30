@@ -13,6 +13,7 @@ import {
   serializeStatus,
   pruneStale,
   recordFailure,
+  failureReason,
   applyStatus,
   statusMessages,
   promotionMessage,
@@ -175,6 +176,38 @@ test('tpm은 청크 초까지 사유에 들어가 별개로 센다', () => {
   assert.deepEqual(entries.map((e) => [e.reason, e.count]), [['tpm-480', 2], ['tpm-240', 1]]);
 });
 
+// ── 사유 문자열: tpm은 "실제로 막힌 구간의 초" ──────────────────────
+
+test('404·rpd는 초를 담지 않는다 (구간 크기와 무관한 판정이다)', () => {
+  assert.equal(failureReason('404', 289), '404');
+  assert.equal(failureReason('rpd', 480), 'rpd');
+});
+
+test('tpm 사유에는 설정값이 아니라 실패한 구간의 실제 초가 들어간다', () => {
+  // 마지막 구간은 영상 끝에서 잘린다: 955초 영상, 청크 480 → 꼬리 구간은 475~955 = 480,
+  // 1244초 영상이면 꼬리가 955~1244 = 289초. 그 289초에서 막힌 것을 480으로 적으면 안 된다.
+  assert.equal(failureReason('tpm', 289), 'tpm-289');
+  assert.equal(failureReason('tpm', 480), 'tpm-480');
+});
+
+test('구간 초가 이상하면 가장 작은 값으로 남긴다 (관찰을 놓치지 않는 쪽)', () => {
+  // 적용 조건이 `현재 청크 >= 기록된 초`라, 작은 값일수록 어떤 청크에서도 살아남는다.
+  for (const bad of [0, -5, NaN, undefined]) {
+    assert.equal(failureReason('tpm', /** @type {any} */ (bad)), 'tpm-1');
+  }
+});
+
+test('꼬리 구간에서 막힌 기록은 그보다 큰 청크 실행에서 유효하다 (오판 회귀)', () => {
+  // 실제 사건 형태: 설정 480, 실제로 막힌 구간은 289초.
+  // 289로 기록하면 --chunk 300 실행이 "300 >= 289"로 보고 그 모델을 계속 제외한다.
+  const correct = apply(`slow-flash blocked tpm-289 x3 ${TODAY}`, ['slow-flash', 'ok-flash'], 300);
+  assert.deepEqual(correct.pool, ['ok-flash'], '이미 289초에서 막힌 모델을 다시 시도하지 않는다');
+
+  // 설정값(480)으로 잘못 기록했다면 300 < 480이라 무시돼, 막힐 것을 알면서 또 시도했다.
+  const wrong = apply(`slow-flash blocked tpm-480 x3 ${TODAY}`, ['slow-flash', 'ok-flash'], 300);
+  assert.deepEqual(wrong.pool, ['slow-flash', 'ok-flash'], '이것이 고치려는 오판이다');
+});
+
 test('사람이 blocked로 고쳐 둔 기록을 도구가 demoted로 되돌리지 않는다', () => {
   const forced = parseStatus('m-flash blocked 404 x1 2026-07-30').entries;
   const r = recordFailure(forced, { model: 'm-flash', reason: '404', date: TODAY });
@@ -237,7 +270,12 @@ test('demoted 모델은 제외가 아니라 맨 뒤로 간다 — 신모델 꼬�
   const pool = ['user-a-flash', 'user-b-flash', 'new-x-flash', 'new-y-flash'];
   const a = apply(`user-a-flash demoted rpd x1 ${TODAY}`, pool);
   assert.deepEqual(a.pool, ['user-b-flash', 'new-x-flash', 'new-y-flash', 'user-a-flash']);
-  assert.match(statusMessages(a)[0], /^! user-a-flash .*맨 뒤로 미룬다/);
+  // 문구는 완료형이어야 한다. "미룬다"는 "아직 앞에 있고 지금부터 미루겠다"로 읽혀
+  // "왜 이 모델이 먼저 호출되나"라는 질문을 낳았다 (실사용 피드백 2026-07-30).
+  const msg = statusMessages(a)[0];
+  assert.match(msg, /^! user-a-flash — 이전 실행 실패 이력 \(rpd x1\) → 순환 맨 뒤로 미뤄둠/);
+  assert.match(msg, /이번 실행의 호출 순서에 이미 반영됨/);
+  assert.ok(!/미룬다/.test(msg), '미래형 문구가 남아 있으면 안 된다');
 });
 
 test('demoted가 여럿이면 원래 순서를 유지한 채 뒤로 간다', () => {
@@ -434,4 +472,33 @@ test('5xx로 재시도만 한 모델도 통보되지 않는다', async () => {
   });
   assert.equal(res.ok, true);
   assert.equal(called, 0, '서버 혼잡은 모델의 결격이 아니다');
+});
+
+test('구조적 TPM 기록에는 설정 청크가 아니라 실패한 구간의 실제 길이가 실린다', async () => {
+  // 955~1244초 꼬리 구간(289초). 설정은 480이지만 이 구간은 289초짜리 요청이다.
+  /** @type {[string, string, number][]} */
+  const seen = [];
+  /** @type {import('../src/model-status.js').StatusEntry[]} */
+  let entries = [];
+  const pool = new ModelPool(['slow-flash', 'ok-flash']);
+
+  const res = await runChunk({
+    apiKey: 'DUMMY', model: 'slow-flash', id: 'x', start: 955, end: 1244, harness: 'H', pool,
+    wait: async () => {},
+    extract: /** @type {any} */ (async ({ model }) => {
+      if (model !== 'slow-flash') return { text: '본문', tokens: 1, finishReason: 'STOP' };
+      throw new ExtractError('HTTP 429', {
+        status: 429,
+        body: '{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel","retryDelay":"5s"}',
+      });
+    }),
+    onFailure: (model, kind, sec) => {
+      seen.push([model, kind, sec]);
+      entries = recordFailure(entries, { model, reason: failureReason(kind, sec), date: TODAY }).entries;
+    },
+  });
+
+  assert.equal(res.ok, true);
+  assert.deepEqual(seen, [['slow-flash', 'tpm', 289]], '구간 길이는 end - start다');
+  assert.deepEqual(entries.map((e) => e.reason), ['tpm-289'], '설정값 480이 아니다');
 });
