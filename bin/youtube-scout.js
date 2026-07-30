@@ -35,6 +35,7 @@ import { segFileName, segDocument, harnessName, today } from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
+import { spinner, bar, fmtSec } from './ui.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
@@ -68,6 +69,16 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
 /** @type {string|null} */
 let logPath = null;
 
+/**
+ * 지금 화면 한 줄을 점유하고 있는 스피너.
+ *
+ * 추출 중에도 429·404·모델 교체 같은 로그가 끼어든다. 스피너가 `\r`로 같은 줄을
+ * 덮어쓰는 동안 다른 출력이 끼어들면 두 줄이 한 줄에 뒤엉킨다. 그래서 모든 출력은
+ * 먼저 이 줄을 비운다. 스피너는 다음 프레임에 새 줄에 스스로 다시 그린다(자기 치유).
+ * @type {import('./ui.js').Spinner|null}
+ */
+let activeSpinner = null;
+
 /** @param {string} msg */
 function stamp(msg) {
   const d = new Date();
@@ -75,16 +86,50 @@ function stamp(msg) {
   return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}] ${msg}`;
 }
 
+/** 파일에만 남긴다. 화면 출력은 호출자가 따로 정한다 (스피너가 줄을 점유하는 경우). */
+function logFile(line) {
+  if (logPath) appendFile(logPath, `${line}\n`, 'utf8').catch(() => {});
+}
+
 /** @param {string} msg */
 function log(msg) {
   const line = stamp(msg);
+  activeSpinner?.clear();
   console.log(line);
-  if (logPath) appendFile(logPath, `${line}\n`, 'utf8').catch(() => {});
+  logFile(line);
 }
 
 /** 사용자에게 보여주되 로그 파일에는 남기지 않는 순수 표시용 출력 */
 function show(msg = '') {
+  activeSpinner?.clear();
   console.log(msg);
+}
+
+/**
+ * 3초 이상 기다릴 때 남은 시간을 보여준다. 아무 출력 없이 멈춰 있으면
+ * 사용자는 죽은 것으로 오해한다 (이 작업의 출발점이 된 실사용 피드백).
+ *
+ * 3초 미만에는 띄우지 않는다 — 깜빡였다 사라지는 줄이 더 산만하다.
+ * 카운트다운 줄은 화면에만 있고 `_batch.log`에는 남기지 않는다. 대기는 사건이 아니다.
+ *
+ * @param {number} ms
+ * @param {string} label
+ */
+async function waitVisible(ms, label) {
+  if (ms < 3_000 || !process.stdout.isTTY) {
+    await sleep(ms);
+    return;
+  }
+  const until = Date.now() + ms;
+  // 프레임 문자를 쓰지 않는다 — 남은 시간이 줄어드는 것 자체가 살아있다는 신호다.
+  const sp = spinner(() => `   ${label} ${fmtSec(Math.max(0, until - Date.now()))} 남음`);
+  activeSpinner = sp;
+  try {
+    await sleep(ms);
+  } finally {
+    sp.done(''); // 줄을 지우고 아무것도 남기지 않는다
+    activeSpinner = null;
+  }
 }
 
 /** @param {number} sec */
@@ -169,7 +214,7 @@ async function runChunk(p) {
         if (attempt > MAX_RETRIES) {
           return { ok: false, daily: false, reason: `429 재시도 ${MAX_RETRIES}회 초과`, model };
         }
-        await sleep(info.waitMs);
+        await waitVisible(info.waitMs, 'TPM 회복 대기 중...');
         continue;
       }
 
@@ -194,7 +239,7 @@ async function runChunk(p) {
       if (e.status >= 500 && attempt <= MAX_RETRIES) {
         const wait = Math.min(attempt * 10_000, 90_000);
         log(`      HTTP ${e.status} — ${wait / 1000}초 후 재시도 (${attempt}/${MAX_RETRIES})`);
-        await sleep(wait);
+        await waitVisible(wait, '서버 혼잡 대기 중...');
         continue;
       }
 
@@ -302,11 +347,31 @@ async function runVideo(p) {
       continue;
     }
 
-    log(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${model})`);
-    const res = await runChunk({
-      apiKey: p.apiKey, model, id: p.meta.id, url: p.meta.url,
-      start: r.start, end: r.end, harness: p.harness, pool: p.pool,
-    });
+    // 청크 추출은 단일 API 호출이라 30초~2분간 출력이 멈춘다. 그 침묵을 사용자가
+    // "죽었다"로 읽는다(실사용 피드백 2026-07-30). TTY에서는 시작 줄을 스피너로 잡아
+    // 경과 시간을 갱신하고, 완료되면 그 줄을 결과 줄로 확정한다.
+    // 非TTY(파이프·리다이렉트)에서는 예전처럼 시작 줄을 그냥 한 줄 출력한다.
+    const startLine = stamp(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s 추출 중 (${model})`);
+    logFile(startLine); // 로그 파일에는 시작 줄이 항상 남는다 (화면 표현과 무관하게)
+
+    const t0 = Date.now();
+    const sp = spinner((frame) => `${startLine} ${frame} ${fmtSec(Date.now() - t0)}`);
+    activeSpinner = sp.active ? sp : null;
+    if (!sp.active) console.log(startLine);
+
+    /** @type {Awaited<ReturnType<typeof runChunk>>} */
+    let res;
+    try {
+      res = await runChunk({
+        apiKey: p.apiKey, model, id: p.meta.id, url: p.meta.url,
+        start: r.start, end: r.end, harness: p.harness, pool: p.pool,
+      });
+    } finally {
+      activeSpinner = null;
+    }
+    // 소요 시간을 결과 줄에 남긴다 — 지금까지 어디에도 기록이 없었다.
+    // 다음 실행의 청크 크기·모델 선택을 판단할 근거가 된다.
+    const took = fmtSec(Date.now() - t0);
 
     if (res.ok) {
       model = res.model;
@@ -319,10 +384,14 @@ async function runVideo(p) {
       );
       done += 1;
       tokens += res.tokens;
-      log(`      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰)`);
+      const line = stamp(`      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰, ${took})`);
+      sp.done(line); // TTY면 스피너 줄을 이 줄로 확정, 아니면 그냥 출력
+      logFile(line);
     } else {
       failed += 1;
-      log(`      실패: ${res.reason}`);
+      const line = stamp(`      실패: ${res.reason} (${took})`);
+      sp.done(line);
+      logFile(line);
       if (res.daily) {
         // 전 모델 RPD 소진. 남은 구간은 다음 실행으로 이월된다.
         carriedOver = true;
@@ -333,7 +402,7 @@ async function runVideo(p) {
     }
 
     // 실측: 분당 15요청 제한 대비. 마지막 구간 뒤에는 기다릴 이유가 없다.
-    if (i < p.ranges.length - 1) await sleep(CALL_INTERVAL_MS);
+    if (i < p.ranges.length - 1) await waitVisible(CALL_INTERVAL_MS, '호출 간격 대기 중...');
   }
 
   const merged = await mergeVideo({
@@ -547,6 +616,12 @@ async function main() {
 
   // 7) 영상별 처리
   const summary = [];
+
+  // 배치 전체 진행률. 완료 청크를 세어서 아는 값이므로 추정이 섞이지 않는다.
+  // 1편·1청크뿐이면 바 하나가 통째로 노이즈라 생략한다.
+  const showBatchBar = batch.totalCalls > 1;
+  let doneChunks = 0;
+
   for (const [i, p] of batch.plans.entries()) {
     const meta = playable.find((m) => m.id === p.id);
     if (!meta) continue;
@@ -566,6 +641,11 @@ async function main() {
       meta, ranges: p.ranges, apiKey, model, harness, harnessLabel,
       chunk, outDir, pool,
     });
+
+    doneChunks += r.merged.okChunks;
+    if (showBatchBar) {
+      log(`   진행: ${bar(doneChunks, batch.totalCalls)} ${doneChunks}/${batch.totalCalls} 청크`);
+    }
 
     summary.push({
       id: p.id,
