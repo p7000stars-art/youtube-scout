@@ -8,7 +8,10 @@ import { join } from 'node:path';
 import {
   initRunDir,
   refreshRunModels,
+  refreshUpdateCheck,
   replaceModelsLine,
+  insertUpdateCheckCall,
+  hasUpdateCheckCall,
   buildRunBat,
   buildRunSh,
   buildLinksTxt,
@@ -16,6 +19,7 @@ import {
   RUN_BAT_NAME,
   RUN_SH_NAME,
   LINKS_NAME,
+  UPDATE_CHECK_NAME,
 } from '../src/init.js';
 
 async function makeCwd() {
@@ -369,4 +373,144 @@ test('replaceModelsLine은 sh의 따옴표를 벗겨 전 목록을 읽는다', (
 
 test('replaceModelsLine은 bat에 non-ASCII 모델명이 들어오면 던진다', () => {
   assert.throws(() => replaceModelsLine('set MODELS=a\r\n', ['모델'], 'bat'), /non-ASCII/);
+});
+
+// ── 업데이트 확인 배선 ──────────────────────────────────────────────
+
+const FAKE_UPDATE_CHECK = '// fake update-check\nconsole.log("x");\n';
+
+test('init은 update-check.js도 생성한다 (본문을 받았을 때)', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, models: MODELS, chunk: 480, updateCheck: FAKE_UPDATE_CHECK });
+
+  assert.ok(r.created.includes(UPDATE_CHECK_NAME));
+  assert.equal(await readFile(join(r.dir, UPDATE_CHECK_NAME), 'utf8'), FAKE_UPDATE_CHECK);
+});
+
+test('본문을 받지 못하면 update-check.js를 만들지 않는다', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  assert.ok(!r.created.includes(UPDATE_CHECK_NAME));
+});
+
+test('run.bat은 npx 호출 앞에서 update-check를 부른다 (도구는 자기 캐시를 지울 수 없다)', () => {
+  const bat = buildRunBat({ chunk: 480, models: MODELS });
+  const lines = bat.split('\r\n');
+  const check = lines.findIndex((l) => l.includes(UPDATE_CHECK_NAME));
+  const npx = lines.findIndex((l) => l.startsWith('call npx '));
+  assert.ok(check > -1, '호출 줄이 있다');
+  assert.ok(check < npx, 'npx 호출보다 앞이다');
+  assert.match(bat, /if not "%UPDATE_CHECK%"=="0" node "%~dp0update-check\.js"/);
+});
+
+test('run.bat은 update-check 줄이 생겨도 ASCII 전용 + CRLF다', () => {
+  const bat = buildRunBat({ chunk: 480, models: MODELS });
+  assert.equal([...bat].filter((c) => c.codePointAt(0) > 0x7f).length, 0);
+  assert.equal(bat.replace(/\r\n/g, '').includes('\n'), false);
+});
+
+test('run.sh도 npx 앞에서 부르고 UPDATE_CHECK=0을 존중한다', () => {
+  const sh = buildRunSh({ chunk: 480, models: MODELS });
+  const lines = sh.split('\n');
+  const check = lines.findIndex((l) => l.includes(UPDATE_CHECK_NAME));
+  const npx = lines.findIndex((l) => l.startsWith('npx '));
+  assert.ok(check > -1 && check < npx);
+  assert.match(sh, /if \[ "\$\{UPDATE_CHECK:-\}" != "0" \]; then/);
+});
+
+// ── --refresh-update-check ──────────────────────────────────────────
+
+/** 업데이트 확인이 없던 시절의 run 파일을 흉내 낸다 */
+function stripUpdateCheck(text, eol) {
+  const lines = text.split(eol === '\r\n' ? '\r\n' : '\n');
+  const start = lines.findIndex((l) => l.includes('UPDATE_CHECK'));
+  const end = lines.findIndex((l) => /^\s*(call )?npx /.test(l));
+  return [...lines.slice(0, start), ...lines.slice(end)].join(eol);
+}
+
+async function makeLegacyEnv() {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  const bat = await readFile(join(r.dir, RUN_BAT_NAME), 'utf8');
+  const sh = await readFile(join(r.dir, RUN_SH_NAME), 'utf8');
+  await writeFile(join(r.dir, RUN_BAT_NAME), stripUpdateCheck(bat, '\r\n'), 'utf8');
+  await writeFile(join(r.dir, RUN_SH_NAME), stripUpdateCheck(sh, '\n'), 'utf8');
+  return { cwd, dir: r.dir };
+}
+
+test('구 실행 폴더에 스크립트와 호출 줄을 보정한다', async () => {
+  const { cwd, dir } = await makeLegacyEnv();
+
+  const r = await refreshUpdateCheck({ cwd, updateCheck: FAKE_UPDATE_CHECK });
+
+  assert.equal(r.dir, dir);
+  assert.equal(r.createdScript, true);
+  assert.deepEqual(r.wired.sort(), [RUN_BAT_NAME, RUN_SH_NAME].sort());
+  assert.deepEqual(r.failed, []);
+  assert.equal(await readFile(join(dir, UPDATE_CHECK_NAME), 'utf8'), FAKE_UPDATE_CHECK);
+
+  const bat = await readFile(join(dir, RUN_BAT_NAME), 'utf8');
+  assert.ok(bat.includes(UPDATE_CHECK_NAME));
+  assert.ok(bat.indexOf(UPDATE_CHECK_NAME) < bat.indexOf('call npx '));
+});
+
+test('보정해도 run.bat은 ASCII 전용 + CRLF를 유지한다', async () => {
+  const { cwd, dir } = await makeLegacyEnv();
+  await refreshUpdateCheck({ cwd, updateCheck: FAKE_UPDATE_CHECK });
+
+  const buf = await readFile(join(dir, RUN_BAT_NAME));
+  assert.deepEqual([...buf].filter((b) => b > 0x7f), []);
+  const text = buf.toString('utf8');
+  assert.ok(text.includes('\r\n'));
+  assert.equal(text.replace(/\r\n/g, '').includes('\n'), false, '외로운 LF가 없다');
+});
+
+test('이미 배선돼 있으면 덮어쓰지 않는다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480, updateCheck: FAKE_UPDATE_CHECK });
+  const before = await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8');
+
+  const r = await refreshUpdateCheck({ cwd, updateCheck: '// 다른 본문\n' });
+
+  assert.equal(r.createdScript, false);
+  assert.equal(r.scriptExists, true);
+  assert.deepEqual(r.already.sort(), [RUN_BAT_NAME, RUN_SH_NAME].sort());
+  assert.deepEqual(r.wired, []);
+  assert.equal(await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8'), before, 'run 파일 무변경');
+  assert.equal(
+    await readFile(join(r0.dir, UPDATE_CHECK_NAME), 'utf8'),
+    FAKE_UPDATE_CHECK,
+    '스크립트도 무변경',
+  );
+});
+
+test('run 파일이 없으면 dir이 null이다 (init을 먼저 하라는 안내는 bin이 한다)', async () => {
+  const cwd = await makeCwd();
+  const r = await refreshUpdateCheck({ cwd, updateCheck: FAKE_UPDATE_CHECK });
+  assert.equal(r.dir, null);
+  assert.deepEqual(r.wired, []);
+});
+
+test('npx 호출 줄을 못 찾으면 추측해서 넣지 않는다', async () => {
+  const cwd = await makeCwd();
+  const dir = join(cwd, RUN_DIR_NAME);
+  await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  // 사용자가 구조를 통째로 바꾼 상황
+  await writeFile(join(dir, RUN_BAT_NAME), '@echo off\r\nrem nothing here\r\n', 'utf8');
+
+  const r = await refreshUpdateCheck({ cwd, updateCheck: FAKE_UPDATE_CHECK });
+  assert.deepEqual(r.noAnchor, [RUN_BAT_NAME]);
+});
+
+test('insertUpdateCheckCall은 개행 방식을 이어받는다', () => {
+  const bat = 'call npx foo\r\n';
+  assert.ok(insertUpdateCheckCall(bat, 'bat').text.includes('\r\n'));
+  const sh = 'npx foo\n';
+  const out = insertUpdateCheckCall(sh, 'sh').text;
+  assert.equal(out.includes('\r'), false);
+});
+
+test('hasUpdateCheckCall은 파일명으로 판정한다 (조건문을 손봤어도 호출은 호출이다)', () => {
+  assert.equal(hasUpdateCheckCall('node "x/update-check.js"'), true);
+  assert.equal(hasUpdateCheckCall('call npx foo'), false);
 });

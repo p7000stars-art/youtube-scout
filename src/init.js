@@ -20,8 +20,53 @@ export const RUN_BAT_NAME = 'run.bat';
 export const RUN_SH_NAME = 'run.sh';
 export const LINKS_NAME = 'links.txt';
 
+/** npx 캐시 갱신 확인 스크립트. bin/update-check.js를 그대로 복사해 둔다. */
+export const UPDATE_CHECK_NAME = 'update-check.js';
+
 /** npx로 부를 저장소. 생성 파일 3종이 같은 값을 쓰도록 한곳에 둔다. */
 const PKG = 'github:p7000stars-art/youtube-scout';
+
+/**
+ * npx 호출 **앞**에 들어가는 업데이트 확인 줄.
+ *
+ * ## 왜 npx 앞인가
+ * 도구는 npx 캐시 폴더 안에서 실행되므로 자기 자신을 지울 수 없다(파일 잠금). 캐시를
+ * 갈아 끼우려면 도구가 뜨기 **전**이어야 하고, 그 자리가 여기다.
+ *
+ * 생성(build)과 기존 파일 보정(insert)이 같은 문자열을 써야 갈라지지 않으므로 한곳에 둔다.
+ *
+ * @param {'bat'|'sh'} kind
+ * @returns {string[]}
+ */
+export function updateCheckLines(kind) {
+  if (kind === 'bat') {
+    // .bat은 ASCII 전용이다(한글은 conhost에서 깨진다). 한국어 설명은 links.txt가 진다.
+    return [
+      'rem Refresh the npx cache before running. npx keys its cache by the spec',
+      'rem string, so without this it reuses the first version it ever downloaded.',
+      'rem Set UPDATE_CHECK=0 to skip. It is silent unless it actually updates.',
+      `if not "%UPDATE_CHECK%"=="0" node "%~dp0${UPDATE_CHECK_NAME}"`,
+      '',
+    ];
+  }
+  return [
+    '# npx는 스펙 문자열을 캐시 키로 쓴다 — 이 확인이 없으면 처음 받은 판을 영원히 재사용한다.',
+    '# 끄려면 UPDATE_CHECK=0 을 주면 된다. 실제로 갱신할 때 말고는 아무것도 출력하지 않는다.',
+    'if [ "${UPDATE_CHECK:-}" != "0" ]; then',
+    `  node "$DIR/${UPDATE_CHECK_NAME}"`,
+    'fi',
+    '',
+  ];
+}
+
+/**
+ * 이 본문에 업데이트 확인 호출이 이미 있는가.
+ * 파일명만 보면 된다 — 사용자가 조건문을 손봤더라도 호출 자체가 있으면 건드릴 이유가 없다.
+ * @param {string} text
+ */
+export function hasUpdateCheckCall(text) {
+  return String(text ?? '').includes(UPDATE_CHECK_NAME);
+}
 
 /**
  * run.bat 본문. **ASCII 전용 + CRLF.**
@@ -73,6 +118,7 @@ export function buildRunBat({ chunk, models }) {
     'exit /b 1',
     '',
     ':run',
+    ...updateCheckLines('bat'),
     'rem %~dp0 is this file folder, so the whole folder can be moved freely.',
     `call npx ${PKG} --file "%~dp0${LINKS_NAME}" -o "%~dp0out" --chunk %CHUNK% --models %MODELS%`,
     '',
@@ -139,6 +185,7 @@ export function buildRunSh({ chunk, models }) {
     '  exit 1',
     'fi',
     '',
+    ...updateCheckLines('sh'),
     `npx ${PKG} --file "$DIR/${LINKS_NAME}" -o "$DIR/out" --chunk "$CHUNK" --models "$MODELS"`,
     '',
     'echo',
@@ -196,7 +243,11 @@ export function buildLinksTxt() {
  * run 파일에는 사용자가 승격한 모델 순서가 들어 있다. 덮어쓰면 둘 다 파괴된다.
  * 그래서 init은 몇 번 실행해도 안전한 연산이어야 한다.
  *
- * @param {{ cwd: string, models: string[], chunk: number }} p
+ * `updateCheck`는 `bin/update-check.js`의 본문이다. src/가 저장소 구조를 알면 껍데기를
+ * 갈아 끼울 때 같이 깨지므로, 파일을 읽는 것은 bin이 하고 여기는 내용만 받는다
+ * (package.json 버전을 bin이 읽어 넘기는 것과 같은 경계).
+ *
+ * @param {{ cwd: string, models: string[], chunk: number, updateCheck?: string }} p
  * @returns {Promise<{
  *   dir: string,
  *   created: string[],
@@ -204,7 +255,7 @@ export function buildLinksTxt() {
  *   chmodOk: boolean
  * }>}
  */
-export async function initRunDir({ cwd, models, chunk }) {
+export async function initRunDir({ cwd, models, chunk, updateCheck }) {
   const dir = join(cwd, RUN_DIR_NAME);
   await mkdir(dir, { recursive: true });
 
@@ -213,6 +264,9 @@ export async function initRunDir({ cwd, models, chunk }) {
     { name: RUN_SH_NAME, body: buildRunSh({ chunk, models }) },
     { name: LINKS_NAME, body: buildLinksTxt() },
   ];
+  // 본문을 받지 못했으면 만들지 않는다. run 파일의 확인 줄은 스크립트가 없으면
+  // node가 즉시 실패하지만, 그 실패는 화면에 한 줄 남길 뿐 npx 호출을 막지 않는다.
+  if (updateCheck) files.push({ name: UPDATE_CHECK_NAME, body: updateCheck });
 
   /** @type {string[]} */
   const created = [];
@@ -377,4 +431,142 @@ export async function refreshRunModels({ cwd, models }) {
   }
 
   return { dir, updated, unchanged, noLine, failed };
+}
+
+// ── 업데이트 확인 배선 보정 (`init --refresh-update-check`) ─────────
+/**
+ * ## 왜 별도 명령인가
+ * 업데이트 확인은 이 판부터 생긴 장치다. 그전에 `init`을 돌린 사용자의 실행 폴더에는
+ * 스크립트도 호출 줄도 없고, `initRunDir`은 기존 파일을 덮어쓰지 않으므로 영원히 안 생긴다.
+ * 그렇다고 도구가 알아서 run 파일을 고치면 "사용자 파일은 건드리지 않는다"가 무너진다.
+ * 그래서 사용자가 직접 부르는 명령으로 둔다 (`--refresh-models`와 같은 계열).
+ */
+
+/**
+ * npx 호출 줄 앞에 업데이트 확인 줄을 끼워 넣는다.
+ *
+ * 이미 호출이 있으면 손대지 않는다. 앵커(npx 호출 줄)를 못 찾으면 아무것도 하지 않는다 —
+ * 사용자가 구조를 바꾼 파일에 추측해서 줄을 넣으면 실행 순서가 뒤바뀔 수 있다.
+ *
+ * @param {string} text
+ * @param {'bat'|'sh'} kind
+ * @returns {{ text: string, changed: boolean, found: boolean, already: boolean }}
+ */
+export function insertUpdateCheckCall(text, kind) {
+  const src = String(text ?? '');
+  if (hasUpdateCheckCall(src)) return { text: src, changed: false, found: true, already: true };
+
+  // 개행 방식을 원본에서 그대로 이어받는다. run.bat의 CRLF가 여기서 깨지면 안 된다.
+  const eol = src.includes('\r\n') ? '\r\n' : '\n';
+  const lines = src.split(/\r?\n/);
+  const anchor = lines.findIndex((l) =>
+    kind === 'bat' ? /^\s*call npx\s/.test(l) : /^\s*npx\s/.test(l),
+  );
+  if (anchor === -1) return { text: src, changed: false, found: false, already: false };
+
+  lines.splice(anchor, 0, ...updateCheckLines(kind));
+  const next = lines.join(eol);
+  if (kind === 'bat') assertAscii(next);
+
+  return { text: next, changed: true, found: true, already: false };
+}
+
+/**
+ * 기존 실행 폴더에 업데이트 확인 장치를 보정한다.
+ *
+ * 스크립트가 이미 있으면 덮어쓰지 않는다 — 사용자가 손댔을 수 있고, 덮어쓰기는 이 명령의
+ * 계약이 아니다(필요하면 파일을 지우고 다시 부르면 된다).
+ *
+ * @param {{ cwd: string, updateCheck: string }} p
+ * @returns {Promise<{
+ *   dir: string|null,
+ *   createdScript: boolean,
+ *   scriptExists: boolean,
+ *   wired: string[],
+ *   already: string[],
+ *   noAnchor: string[],
+ *   failed: { name: string, error: string }[]
+ * }>}
+ */
+export async function refreshUpdateCheck({ cwd, updateCheck }) {
+  const targets = /** @type {const} */ ([
+    [RUN_BAT_NAME, 'bat'],
+    [RUN_SH_NAME, 'sh'],
+  ]);
+
+  // run 파일이 있는 곳을 실행 폴더로 본다 (refreshRunModels와 같은 규칙).
+  /** @type {string|null} */
+  let dir = null;
+  for (const candidate of [join(cwd, RUN_DIR_NAME), cwd]) {
+    for (const [name] of targets) {
+      try {
+        await access(join(candidate, name));
+        dir = candidate;
+        break;
+      } catch {
+        // 다음 후보
+      }
+    }
+    if (dir) break;
+  }
+
+  /** @type {string[]} */
+  const wired = [];
+  /** @type {string[]} */
+  const already = [];
+  /** @type {string[]} */
+  const noAnchor = [];
+  /** @type {{ name: string, error: string }[]} */
+  const failed = [];
+
+  if (!dir) {
+    return { dir: null, createdScript: false, scriptExists: false, wired, already, noAnchor, failed };
+  }
+
+  // 1) 스크립트 배치
+  const scriptPath = join(dir, UPDATE_CHECK_NAME);
+  let scriptExists = true;
+  let createdScript = false;
+  try {
+    await access(scriptPath);
+  } catch {
+    scriptExists = false;
+  }
+  if (!scriptExists) {
+    try {
+      await writeFile(scriptPath, updateCheck, 'utf8');
+      createdScript = true;
+    } catch (e) {
+      failed.push({ name: UPDATE_CHECK_NAME, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  // 2) 호출 줄 배선
+  for (const [name, kind] of targets) {
+    const path = join(dir, name);
+    let text;
+    try {
+      text = await readFile(path, 'utf8');
+    } catch {
+      continue; // 한쪽만 쓰는 환경도 정상이다
+    }
+
+    try {
+      const r = insertUpdateCheckCall(text, /** @type {'bat'|'sh'} */ (kind));
+      if (r.already) {
+        already.push(name);
+        continue;
+      }
+      if (!r.found) {
+        noAnchor.push(name);
+        continue;
+      }
+      await writeFile(path, r.text, 'utf8');
+      wired.push(name);
+    } catch (e) {
+      failed.push({ name, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return { dir, createdScript, scriptExists, wired, already, noAnchor, failed };
 }
