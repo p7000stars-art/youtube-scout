@@ -7,6 +7,8 @@ import { join } from 'node:path';
 
 import {
   initRunDir,
+  refreshRunModels,
+  replaceModelsLine,
   buildRunBat,
   buildRunSh,
   buildLinksTxt,
@@ -232,4 +234,139 @@ test('조회된 모델 목록이 그대로 run 파일에 들어간다 (하드코
 
 test('links.txt는 모델 목록과 무관하게 같다 (링크만 담는 파일이다)', () => {
   assert.equal(buildLinksTxt(), buildLinksTxt());
+});
+
+// ── --refresh-models (MODELS 줄만 갱신) ─────────────────────────────
+
+const FRESH = ['gemini-4.0-flash', 'gemini-4.0-flash-lite', 'gemini-flash-latest'];
+
+test('MODELS 줄만 바뀌고 CHUNK와 나머지 줄은 그대로다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 720 });
+  const batBefore = await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8');
+  const shBefore = await readFile(join(r0.dir, RUN_SH_NAME), 'utf8');
+
+  const r = await refreshRunModels({ cwd, models: FRESH });
+  assert.equal(r.dir, r0.dir);
+  assert.deepEqual(r.updated.map((u) => u.name).sort(), [RUN_BAT_NAME, RUN_SH_NAME].sort());
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.noLine, []);
+
+  const bat = await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8');
+  const sh = await readFile(join(r0.dir, RUN_SH_NAME), 'utf8');
+
+  assert.match(bat, /^set MODELS=gemini-4\.0-flash,gemini-4\.0-flash-lite,gemini-flash-latest$/m);
+  assert.match(sh, /^MODELS="gemini-4\.0-flash,gemini-4\.0-flash-lite,gemini-flash-latest"$/m);
+  assert.match(bat, /^set CHUNK=720$/m, 'CHUNK 보존');
+  assert.match(sh, /^CHUNK=720$/m, 'CHUNK 보존');
+
+  // MODELS 줄 하나 말고는 아무것도 달라지지 않았다
+  const strip = (/** @type {string} */ t) =>
+    t.split(/\r?\n/).filter((l) => !/^\s*(set )?MODELS=/.test(l));
+  assert.deepEqual(strip(bat), strip(batBefore));
+  assert.deepEqual(strip(sh), strip(shBefore));
+});
+
+test('갱신 후에도 run.bat은 ASCII 전용 + CRLF다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  await refreshRunModels({ cwd, models: FRESH });
+
+  const buf = await readFile(join(r0.dir, RUN_BAT_NAME));
+  assert.deepEqual([...buf].filter((b) => b > 0x7f), [], 'non-ASCII 바이트 없음');
+
+  const text = buf.toString('utf8');
+  assert.ok(text.includes('\r\n'));
+  assert.equal(text.replace(/\r\n/g, '').includes('\n'), false, '외로운 LF가 없다');
+});
+
+test('갱신은 사용자 링크를 건드리지 않는다 (links.txt는 대상이 아니다)', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  const myLinks = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ\n';
+  await writeFile(join(r0.dir, LINKS_NAME), myLinks, 'utf8');
+
+  await refreshRunModels({ cwd, models: FRESH });
+  assert.equal(await readFile(join(r0.dir, LINKS_NAME), 'utf8'), myLinks);
+});
+
+test('run 파일이 없으면 dir이 null이다 (init을 먼저 하라는 안내는 bin이 한다)', async () => {
+  const cwd = await makeCwd();
+  const r = await refreshRunModels({ cwd, models: FRESH });
+  assert.equal(r.dir, null);
+  assert.deepEqual(r.updated, []);
+});
+
+test('run 폴더 안에서 불러도 찾는다 (사용자가 그 안에서 명령을 친다)', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+
+  const r = await refreshRunModels({ cwd: r0.dir, models: FRESH });
+  assert.equal(r.dir, r0.dir);
+  assert.equal(r.updated.length, 2);
+});
+
+test('이미 같은 목록이면 unchanged로 보고하고 파일을 다시 쓰지 않는다', async () => {
+  const cwd = await makeCwd();
+  await initRunDir({ cwd, models: MODELS, chunk: 480 });
+
+  const r = await refreshRunModels({ cwd, models: MODELS });
+  assert.deepEqual(r.updated, []);
+  assert.deepEqual(r.unchanged.sort(), [RUN_BAT_NAME, RUN_SH_NAME].sort());
+});
+
+test('MODELS 줄이 사라졌으면 추측해서 끼워 넣지 않는다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+
+  const bat = await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8');
+  await writeFile(
+    join(r0.dir, RUN_BAT_NAME),
+    bat.split('\r\n').filter((l) => !l.startsWith('set MODELS=')).join('\r\n'),
+    'utf8',
+  );
+
+  const r = await refreshRunModels({ cwd, models: FRESH });
+  assert.deepEqual(r.noLine, [RUN_BAT_NAME]);
+  assert.deepEqual(r.updated.map((u) => u.name), [RUN_SH_NAME]);
+});
+
+test('전후 목록을 함께 돌려준다 (사용자가 자기 승격이 덮였는지 봐야 한다)', async () => {
+  const cwd = await makeCwd();
+  await initRunDir({ cwd, models: MODELS, chunk: 480 });
+
+  const r = await refreshRunModels({ cwd, models: FRESH });
+  const bat = r.updated.find((u) => u.name === RUN_BAT_NAME);
+  assert.ok(bat);
+  assert.equal(bat.before, MODELS.join(','));
+  assert.equal(bat.after, FRESH.join(','));
+});
+
+test('한쪽 run 파일만 있어도 정상 동작한다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, models: MODELS, chunk: 480 });
+  const { rm } = await import('node:fs/promises');
+  await rm(join(r0.dir, RUN_SH_NAME));
+
+  const r = await refreshRunModels({ cwd, models: FRESH });
+  assert.deepEqual(r.updated.map((u) => u.name), [RUN_BAT_NAME]);
+});
+
+test('replaceModelsLine은 CRLF와 들여쓰기를 유지한다', () => {
+  const src = 'set CHUNK=480\r\nset MODELS=a,b\r\nrem tail\r\n';
+  const r = replaceModelsLine(src, ['x', 'y'], 'bat');
+  assert.equal(r.text, 'set CHUNK=480\r\nset MODELS=x,y\r\nrem tail\r\n');
+  assert.equal(r.before, 'a,b');
+  assert.equal(r.after, 'x,y');
+  assert.equal(r.changed, true);
+});
+
+test('replaceModelsLine은 sh의 따옴표를 벗겨 전 목록을 읽는다', () => {
+  const r = replaceModelsLine('MODELS="a,b"\n', ['x'], 'sh');
+  assert.equal(r.before, 'a,b');
+  assert.equal(r.text, 'MODELS="x"\n');
+});
+
+test('replaceModelsLine은 bat에 non-ASCII 모델명이 들어오면 던진다', () => {
+  assert.throws(() => replaceModelsLine('set MODELS=a\r\n', ['모델'], 'bat'), /non-ASCII/);
 });

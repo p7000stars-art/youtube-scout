@@ -114,6 +114,52 @@ export function planBatch(videos, opts = {}) {
 }
 
 /**
+ * 일일 한도 추정치를 계산한다.
+ *
+ * ## 왜 "모델 수 × 20"이 아닌가 (실측 2026-07-31)
+ * 예전 계산은 풀에 있는 모델을 전부 세었다. 실측에서 15종 중 5종이 강등·퇴역 상태라
+ * 실질 한도는 60~80회였는데 화면에는 300회라고 떴다. 3~5배 낙관적인 숫자를 보여주고
+ * 첫 청크부터 429를 맞는 일이 실제로 일어났다. 이 도구는 "실행 전 예상 요청 수 안내"를
+ * 핵심 기능으로 삼는데, 숫자가 틀리면 그 경고가 무력해진다.
+ *
+ * 그래서 **실패 이력이 없는 모델만** 센다. 차단(blocked)은 물론이고 강등(demoted)도 뺀다 —
+ * 강등 사유(404·rpd·구조적 tpm)는 전부 "그 모델이 요청을 받아내지 못했다"는 뜻이라
+ * 한도를 채워 줄 근거가 되지 못한다.
+ *
+ * ## 가용 0종이면 전체 풀로 계산한다
+ * 0으로 계산하면 요청이 몇 개든 항상 한도 초과가 되어 매 실행 경고가 뜬다. 경고가 상시가
+ * 되면 아무도 읽지 않는다. 대신 "모든 모델에 실패 이력이 있다"는 사실을 문구로 말해 준다.
+ *
+ * @param {{ poolSize: number, demotedCount: number, blockedCount?: number, perModel?: number }} p
+ *   poolSize는 blocked를 제외한 최종 풀 크기, demotedCount·blockedCount는 **모델 수**다
+ *   (기록 수가 아니다 — 한 모델이 404와 rpd 기록을 동시에 가질 수 있다)
+ * @returns {{ dailyLimit: number, usable: number, basis: number, allFailed: boolean, note: string }}
+ *   note는 화면에 그대로 붙일 괄호 안 문구다. 출력은 호출자(bin)가 한다
+ */
+export function budgetEstimate(p) {
+  const perModel = Number.isFinite(p.perModel) ? Number(p.perModel) : DEFAULT_DAILY_LIMIT;
+  const pool = Math.max(0, Math.floor(Number(p.poolSize) || 0));
+  const demoted = Math.max(0, Math.floor(Number(p.demotedCount) || 0));
+  const blocked = Math.max(0, Math.floor(Number(p.blockedCount) || 0));
+
+  // 강등 모델이 풀보다 많게 셈해질 여지를 막는다 (기록이 풀 밖 모델을 가리킬 수 있다).
+  const usable = Math.max(0, pool - Math.min(demoted, pool));
+  const allFailed = usable === 0 && pool > 0;
+  const basis = allFailed ? pool : usable;
+
+  const excluded = [];
+  if (demoted) excluded.push(`강등 ${demoted}종`);
+  if (blocked) excluded.push(`차단 ${blocked}종`);
+
+  const note = allFailed
+    ? `전체 ${basis}종 × 일일 ${perModel}회 추정 — 모든 모델에 실패 이력이 있다`
+    : `가용 ${basis}종 × 일일 ${perModel}회 추정` +
+      (excluded.length ? `, ${excluded.join('·')} 제외` : '');
+
+  return { dailyLimit: basis * perModel, usable, basis, allFailed, note };
+}
+
+/**
  * 한도를 넘겼을 때 제시할 대안 3개. 문구만 만들고 출력은 하지 않는다.
  *
  * @param {{ totalCalls: number, dailyLimit: number, chunk: number, modelCount: number }} ctx
