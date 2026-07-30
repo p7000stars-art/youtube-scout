@@ -8,6 +8,8 @@ import {
   fetchAvailableModels,
   reconcilePool,
   reconcileMessages,
+  sortModelPool,
+  parseModelVersion,
   stripPrefix,
 } from '../src/models.js';
 
@@ -196,4 +198,131 @@ test('편입이 여러 건이어도 안내는 한 줄로 접힌다 (제외 경�
 test('바뀐 것이 없으면 안내 문구도 없다', () => {
   const r = reconcilePool(['gemini-3.6-flash'], ['gemini-3.6-flash']);
   assert.deepEqual(reconcileMessages(r), []);
+});
+
+// ── 정렬 (init이 목록을 만들 때만 적용된다) ─────────────────────────
+
+/**
+ * 실측 2026-07-31의 조회 목록(15종)을 API 응답 순서 그대로 둔 것.
+ * 앞머리 5종(2.5-flash + 2.0 계열 4종)이 전부 사실상 사용 불가였다 —
+ * 이 순서를 그대로 쓰면 매 실행이 죽은 구간을 먼저 들이받는다.
+ */
+const OBSERVED_15 = [
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-001',
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash-lite-001',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-3.1-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-preview',
+  'gemini-3.6-flash',
+  'gemini-3.6-flash-lite',
+  'gemini-3.6-flash-preview',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+  'gemini-omni-flash-preview',
+];
+
+test('실측 15종의 정렬 순서를 고정한다 (신형 우선 + 별칭 꼬리)', () => {
+  assert.deepEqual(sortModelPool(OBSERVED_15), [
+    // 3.6 세대 — stable full → stable lite → preview
+    'gemini-3.6-flash',
+    'gemini-3.6-flash-lite',
+    'gemini-3.6-flash-preview',
+    // 3.5
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-preview',
+    // 3.1
+    'gemini-3.1-flash',
+    // 2.5
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    // 2.0 — 입력 순서 유지
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-001',
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash-lite-001',
+    // 버전 없는 이름(별칭 등)은 전부 뒤
+    'gemini-flash-latest',
+    'gemini-flash-lite-latest',
+    'gemini-omni-flash-preview',
+  ]);
+});
+
+test('실측에서 완주한 3.6-flash가 첫째다', () => {
+  assert.equal(sortModelPool(OBSERVED_15)[0], 'gemini-3.6-flash');
+});
+
+test('별칭·비버전 이름은 전부 꼬리다 (산출물에서 실체를 복원할 수 없다)', () => {
+  const sorted = sortModelPool(OBSERVED_15);
+  const aliases = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-omni-flash-preview'];
+  assert.deepEqual(sorted.slice(-3), aliases);
+  // 버전이 명시된 모델은 하나도 별칭 뒤에 있지 않다
+  const firstAlias = sorted.findIndex((m) => aliases.includes(m));
+  assert.ok(sorted.slice(firstAlias).every((m) => aliases.includes(m)));
+});
+
+test('preview는 같은 세대 stable보다 뒤다 (프리뷰일수록 쿼터가 조인다)', () => {
+  const sorted = sortModelPool(['gemini-3.5-flash-preview', 'gemini-3.5-flash']);
+  assert.deepEqual(sorted, ['gemini-3.5-flash', 'gemini-3.5-flash-preview']);
+});
+
+test('lite는 full보다 뒤다', () => {
+  const sorted = sortModelPool(['gemini-3.6-flash-lite', 'gemini-3.6-flash']);
+  assert.deepEqual(sorted, ['gemini-3.6-flash', 'gemini-3.6-flash-lite']);
+});
+
+test('버전은 숫자로 비교한다 — 3.10이 3.5보다 앞', () => {
+  // 문자열 비교였다면 "3.10" < "3.5" 라서 신형이 뒤로 밀린다.
+  assert.deepEqual(sortModelPool(['gemini-3.5-flash', 'gemini-3.10-flash']), [
+    'gemini-3.10-flash',
+    'gemini-3.5-flash',
+  ]);
+  assert.deepEqual(sortModelPool(['gemini-3.9-flash', 'gemini-3.10-flash']), [
+    'gemini-3.10-flash',
+    'gemini-3.9-flash',
+  ]);
+});
+
+test('메이저가 다르면 메이저가 먼저다 (10 > 9)', () => {
+  assert.deepEqual(sortModelPool(['gemini-9.9-flash', 'gemini-10.0-flash']), [
+    'gemini-10.0-flash',
+    'gemini-9.9-flash',
+  ]);
+});
+
+test('동순위는 입력 순서를 보존한다 (임의 규칙을 더 만들지 않는다)', () => {
+  const same = ['gemini-3.6-flash-b', 'gemini-3.6-flash-a', 'gemini-3.6-flash-c'];
+  assert.deepEqual(sortModelPool(same), same);
+  const aliases = ['zeta-flash', 'alpha-flash', 'mid-flash'];
+  assert.deepEqual(sortModelPool(aliases), aliases);
+});
+
+test('정렬은 새 배열을 준다 (입력을 흔들지 않는다)', () => {
+  const input = [...OBSERVED_15];
+  const out = sortModelPool(input);
+  assert.notEqual(out, input);
+  assert.deepEqual(input, OBSERVED_15);
+});
+
+test('빈 입력·잘못된 입력에도 던지지 않는다', () => {
+  assert.deepEqual(sortModelPool([]), []);
+  assert.deepEqual(sortModelPool(/** @type {any} */ (null)), []);
+  assert.deepEqual(sortModelPool(['a-flash']), ['a-flash']);
+});
+
+test('버전 파싱: 소수점 없는 세대는 minor 0으로 본다', () => {
+  assert.deepEqual(parseModelVersion('gemini-3-flash'), { major: 3, minor: 0 });
+  assert.deepEqual(parseModelVersion('gemini-3.6-flash'), { major: 3, minor: 6 });
+  assert.equal(parseModelVersion('gemini-flash-latest'), null);
+  assert.equal(parseModelVersion('gemini-omni-flash-preview'), null);
+});
+
+test('gemini-3-flash 는 gemini-3.6-flash 보다 뒤다 (3.0 < 3.6)', () => {
+  assert.deepEqual(sortModelPool(['gemini-3-flash', 'gemini-3.6-flash']), [
+    'gemini-3.6-flash',
+    'gemini-3-flash',
+  ]);
 });

@@ -12,7 +12,7 @@
  * 키는 환경변수로만 받는다는 규칙이 생성물에서도 그대로 유지돼야 한다.
  */
 
-import { writeFile, mkdir, chmod, access } from 'node:fs/promises';
+import { writeFile, readFile, mkdir, chmod, access } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export const RUN_DIR_NAME = 'youtube-scout-run';
@@ -88,10 +88,17 @@ export function buildRunBat({ chunk, models }) {
     '',
   ];
 
-  const text = `${lines.join('\r\n')}`;
+  return assertAscii(`${lines.join('\r\n')}`);
+}
 
-  // 안전망. 나중에 누가 한글 안내를 넣으면 여기서 즉시 터진다 (조용히 깨진 .bat보다 낫다).
-  const bad = [...text].find((ch) => ch.codePointAt(0) > 0x7f);
+/**
+ * .bat 본문의 ASCII 안전망. 나중에 누가 한글 안내를 넣거나 모델명에 non-ASCII가 섞이면
+ * 여기서 즉시 터진다 — 조용히 깨진 .bat보다 낫다.
+ * @param {string} text
+ * @returns {string} 그대로 돌려준다 (호출부에서 바로 이어 쓸 수 있게)
+ */
+function assertAscii(text) {
+  const bad = [...text].find((ch) => (ch.codePointAt(0) ?? 0) > 0x7f);
   if (bad) {
     throw new Error(`run.bat에 non-ASCII 문자가 있다: ${JSON.stringify(bad)}`);
   }
@@ -236,4 +243,138 @@ export async function initRunDir({ cwd, models, chunk }) {
   }
 
   return { dir, created, skipped, chmodOk };
+}
+
+// ── MODELS 줄만 갱신 (`init --refresh-models`) ──────────────────────
+/**
+ * ## 왜 이 기능이 따로 있는가
+ * `initRunDir`는 기존 파일을 절대 덮어쓰지 않는다. 그 규칙 덕분에 안전하지만, 이미 환경을
+ * 만들어 둔 사용자는 모델 목록을 갱신할 방법이 파일 삭제밖에 없었다 — 그러면 사용자가
+ * 승격해 둔 순서와 CHUNK 설정까지 같이 날아간다.
+ *
+ * 그래서 **MODELS 줄만** 바꾸는 명시적 명령을 둔다. "목록은 사용자 것"이라는 원칙과
+ * 충돌하지 않는 이유는 사용자가 직접 이 명령을 불렀기 때문이다. 도구가 스스로 판단해
+ * 순서를 고치는 것과 사용자가 갱신을 요청하는 것은 다른 사건이다.
+ */
+
+/** run 파일 종류별 MODELS 줄의 형태. 두 파일의 문법이 달라 한곳에 모아 둔다. */
+const MODELS_LINE = {
+  // .bat: `set MODELS=a,b,c`
+  bat: {
+    re: /^([ \t]*set MODELS=)(.*)$/m,
+    build: /** @param {string[]} m */ (m) => `set MODELS=${m.join(',')}`,
+  },
+  // .sh: `MODELS="a,b,c"`
+  sh: {
+    re: /^([ \t]*MODELS=)(.*)$/m,
+    build: /** @param {string[]} m */ (m) => `MODELS="${m.join(',')}"`,
+  },
+};
+
+/**
+ * 본문에서 MODELS 줄 하나만 갈아 끼운다. 다른 줄(CHUNK·주석·사용자가 손댄 부분)은 손대지 않는다.
+ *
+ * 개행은 건드리지 않는다 — 정규식이 줄 내용만 잡고 `\r\n`은 매치 밖에 남으므로
+ * run.bat의 CRLF가 그대로 유지된다 (`$`는 multiline에서 `\r` 앞에도 선다).
+ *
+ * @param {string} text 원본 본문
+ * @param {string[]} models
+ * @param {'bat'|'sh'} kind
+ * @returns {{ text: string, before: string, after: string, found: boolean, changed: boolean }}
+ */
+export function replaceModelsLine(text, models, kind) {
+  const spec = MODELS_LINE[kind];
+  const src = String(text ?? '');
+  const m = spec.re.exec(src);
+
+  if (!m) return { text: src, before: '', after: '', found: false, changed: false };
+
+  const before = m[2].trim().replace(/^"(.*)"$/, '$1');
+  const line = spec.build(models);
+  const after = models.join(',');
+  const next = src.replace(spec.re, line);
+
+  // .bat은 ASCII 전용이 계약이다. 갱신 경로에서도 같은 안전망을 통과시킨다.
+  if (kind === 'bat') assertAscii(next);
+
+  return { text: next, before, after, found: true, changed: next !== src };
+}
+
+/**
+ * 기존 실행 환경의 run 파일에서 MODELS 줄을 갱신한다.
+ *
+ * 찾는 위치는 `<cwd>/youtube-scout-run/` 우선, 없으면 `<cwd>` 자체다 — 사용자가 run 폴더
+ * 안에서 명령을 부르는 경우가 자연스럽기 때문이다. 두 곳 모두 run 파일이 없으면
+ * 아무것도 쓰지 않고 그 사실을 돌려준다 (init을 먼저 하라는 안내는 호출자가 한다).
+ *
+ * @param {{ cwd: string, models: string[] }} p
+ * @returns {Promise<{
+ *   dir: string|null,
+ *   updated: { name: string, before: string, after: string }[],
+ *   unchanged: string[],
+ *   noLine: string[],
+ *   failed: { name: string, error: string }[]
+ * }>} dir이 null이면 run 파일을 찾지 못한 것이다
+ */
+export async function refreshRunModels({ cwd, models }) {
+  const targets = /** @type {const} */ ([
+    [RUN_BAT_NAME, 'bat'],
+    [RUN_SH_NAME, 'sh'],
+  ]);
+
+  /** run 파일이 하나라도 있는 첫 후보 폴더를 쓴다. @type {string|null} */
+  let dir = null;
+  for (const candidate of [join(cwd, RUN_DIR_NAME), cwd]) {
+    for (const [name] of targets) {
+      try {
+        await access(join(candidate, name));
+        dir = candidate;
+        break;
+      } catch {
+        // 다음 후보
+      }
+    }
+    if (dir) break;
+  }
+
+  /** @type {{ name: string, before: string, after: string }[]} */
+  const updated = [];
+  /** @type {string[]} */
+  const unchanged = [];
+  /** @type {string[]} */
+  const noLine = [];
+  /** @type {{ name: string, error: string }[]} */
+  const failed = [];
+
+  if (!dir) return { dir: null, updated, unchanged, noLine, failed };
+
+  for (const [name, kind] of targets) {
+    const path = join(dir, name);
+    let text;
+    try {
+      text = await readFile(path, 'utf8');
+    } catch {
+      continue; // 한쪽만 있는 환경(예: run.sh를 지운 macOS 사용자)도 정상으로 다룬다
+    }
+
+    try {
+      const r = replaceModelsLine(text, models, /** @type {'bat'|'sh'} */ (kind));
+      if (!r.found) {
+        // 사용자가 줄을 지웠거나 형태를 바꿨다. 추측해서 새 줄을 끼워 넣지 않는다 —
+        // 어디에 넣어도 사용자의 의도와 다를 수 있다.
+        noLine.push(name);
+        continue;
+      }
+      if (!r.changed) {
+        unchanged.push(name);
+        continue;
+      }
+      await writeFile(path, r.text, 'utf8');
+      updated.push({ name, before: r.before, after: r.after });
+    } catch (e) {
+      failed.push({ name, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return { dir, updated, unchanged, noLine, failed };
 }

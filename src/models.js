@@ -145,6 +145,87 @@ export function reconcilePool(userPool, available) {
 }
 
 /**
+ * 모델명에서 세대 번호를 뽑는다. `gemini-3.6-flash` → `{ major: 3, minor: 6 }`.
+ *
+ * 별칭(`gemini-flash-latest`)이나 비버전 이름(`gemini-omni-flash-preview`)은 숫자가 없어
+ * `null`이 나온다. 그 null이 곧 "실체를 모른다"는 신호이고, 정렬에서 뒤로 미는 근거가 된다.
+ *
+ * @param {string} name
+ * @returns {{ major: number, minor: number }|null}
+ */
+export function parseModelVersion(name) {
+  const m = /gemini-(\d+)(?:\.(\d+))?-/.exec(String(name ?? '').toLowerCase());
+  if (!m) return null;
+  return { major: Number(m[1]), minor: m[2] == null ? 0 : Number(m[2]) };
+}
+
+/**
+ * 모델 목록을 우선순위 순으로 정렬한다. **init이 목록을 만들 때만 쓴다.**
+ *
+ * ## 왜 정렬하는가 (실측 2026-07-31)
+ * `/v1beta/models`가 주는 순서는 대체로 구세대가 앞이다. 그 순서를 그대로 쓰면 실행이
+ * 죽은 구간을 먼저 들이받는다 — 실측에서 앞머리 5종이 전부 사실상 사용 불가였다:
+ * `gemini-2.5-flash`는 404 퇴역, `gemini-2.0-flash` 계열 4종은 자정 리셋 직후에도
+ * 즉시 RPD 또는 구조적 TPM. 반면 3.x 신형 3종은 전부 완주했다.
+ * 매 실행이 그 죽은 구간을 통과하는 데 2~5분을 태웠다. 그래서 신형을 앞에 둔다.
+ *
+ * ## 왜 별칭(-latest)은 꼬리인가
+ * ① **실체를 복원할 수 없다.** API가 자기 실체를 밝히지 않는다 —
+ *    `gemini-3.6-flash`는 version이 `3.6-flash-07-2026`(실체 명시)인데
+ *    `gemini-flash-latest`는 `Gemini Flash Latest`(자기 이름 반복)다.
+ *    산출물 frontmatter에 별칭이 각인되면 "어느 모델로 뽑았는가"가 영구히 미상이 된다.
+ *    harness_sha256·scout_version을 각인해 재현성을 지킨다는 원칙과 정면으로 충돌한다.
+ * ② **쿼터를 나눠 쓸 가능성이 있다.** 쿼터는 모델별로 분리되는데(PerProjectPerModel),
+ *    별칭이 가리키는 실체가 목록의 명시 모델과 같으면 둘은 한 칸이다. 나란히 앞에 두면
+ *    순환이 두 칸인 줄 알았는데 실제로는 한 칸인 상황이 된다.
+ *
+ * ## "새 모델은 꼬리" 원칙과의 관계
+ * 그 원칙은 **실행 중 새로 발견된 모델**(reconcilePool의 편입)에 대한 것이고 지금도 유효하다.
+ * 여기는 init이 목록을 처음 만들 때의 초기 순서이고, 사용자는 그 순서를 언제든 바꾼다.
+ *
+ * ## 하지 않는 것
+ * 실행 시점에 사용자의 MODELS(run 파일·`--models`)를 재정렬하지 않는다. 그 순서는
+ * 사용자의 검증 게이트라서 도구가 손대면 게이트가 무의미해진다 (model-status.js와 같은 규칙).
+ *
+ * @param {string[]} models
+ * @returns {string[]} 새 배열. 입력은 건드리지 않는다
+ */
+export function sortModelPool(models) {
+  const list = (models ?? []).map((m) => String(m));
+
+  /** @param {string} name */
+  const rank = (name) => {
+    const lower = name.toLowerCase();
+    const v = parseModelVersion(lower);
+    return {
+      // 그룹 0 = 버전이 명시된 이름, 그룹 1 = 별칭·비버전. 그룹 1은 통째로 뒤다.
+      group: v ? 0 : 1,
+      major: v ? v.major : 0,
+      minor: v ? v.minor : 0,
+      // 실측: 프리뷰일수록 쿼터가 더 조여 있다. 같은 세대면 stable이 앞이다.
+      preview: lower.includes('preview') ? 1 : 0,
+      // 판독력은 용량이 큰 쪽이 유리하다는 가정 — 미검증이라 순위로만 반영한다.
+      lite: lower.includes('lite') ? 1 : 0,
+    };
+  };
+
+  // 인덱스를 함께 들고 정렬해 동순위의 입력 순서를 보장한다. Node의 sort는 안정 정렬이지만
+  // 규칙을 코드에 남긴다 — "임의 규칙을 더 만들지 않는다"가 마지막 정렬 키다.
+  return list
+    .map((name, i) => ({ name, i, r: rank(name) }))
+    .sort((a, b) => {
+      if (a.r.group !== b.r.group) return a.r.group - b.r.group;
+      // 숫자로 비교한다. 문자열 비교였다면 "3.10" < "3.5" 가 되어 신형이 뒤로 밀린다.
+      if (a.r.major !== b.r.major) return b.r.major - a.r.major;
+      if (a.r.minor !== b.r.minor) return b.r.minor - a.r.minor;
+      if (a.r.preview !== b.r.preview) return a.r.preview - b.r.preview;
+      if (a.r.lite !== b.r.lite) return a.r.lite - b.r.lite;
+      return a.i - b.i;
+    })
+    .map((e) => e.name);
+}
+
+/**
  * 대조 결과 안내 문구. 출력은 호출자(bin)가 한다.
  * @param {{ removed: string[], appended: string[] }} r
  * @returns {string[]}

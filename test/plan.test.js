@@ -6,6 +6,7 @@ import {
   planRanges,
   planVideo,
   planBatch,
+  budgetEstimate,
   DEFAULT_CHUNK_SEC,
   DEFAULT_OVERLAP_SEC,
   DEFAULT_DAILY_LIMIT,
@@ -97,4 +98,55 @@ test('구간은 겹침만큼만 되돌아가고 순서가 단조 증가한다', 
     assert.ok(ranges[i].start > ranges[i - 1].start);
   }
   assert.equal(ranges.at(-1)?.end, 5000);
+});
+
+// ── 예산 추정 (실패 이력이 있는 모델은 한도를 채워 주지 못한다) ─────
+
+test('강등 모델은 한도 계산에서 빠진다 (실측 2026-07-31: 15종 풀에 실질 가용 4종)', () => {
+  // 예전 계산은 15 × 20 = 300회를 보여줬고, 그 숫자를 믿고 진행한 실행이 첫 청크부터 429였다.
+  const b = budgetEstimate({ poolSize: 9, demotedCount: 5, blockedCount: 0 });
+  assert.equal(b.usable, 4);
+  assert.equal(b.dailyLimit, 80);
+  assert.equal(b.allFailed, false);
+  assert.match(b.note, /가용 4종 × 일일 20회 추정/);
+  assert.match(b.note, /강등 5종 제외/);
+});
+
+test('차단이 있으면 강등과 함께 표기한다 (해법이 다르므로 뭉치지 않는다)', () => {
+  const b = budgetEstimate({ poolSize: 9, demotedCount: 5, blockedCount: 1 });
+  assert.match(b.note, /강등 5종·차단 1종 제외/);
+  assert.equal(b.dailyLimit, 80);
+});
+
+test('실패 이력이 없으면 제외 문구가 붙지 않는다', () => {
+  const b = budgetEstimate({ poolSize: 3, demotedCount: 0 });
+  assert.equal(b.dailyLimit, 60);
+  assert.equal(b.note, '가용 3종 × 일일 20회 추정');
+});
+
+test('가용 0종이면 전체 풀로 계산하고 사실을 덧붙인다 (상시 경고를 막는다)', () => {
+  // 0으로 계산하면 요청이 몇 개든 항상 한도 초과가 되어 경고가 상시가 되고, 아무도 읽지 않는다.
+  const b = budgetEstimate({ poolSize: 4, demotedCount: 4, blockedCount: 2 });
+  assert.equal(b.usable, 0);
+  assert.equal(b.allFailed, true);
+  assert.equal(b.basis, 4);
+  assert.equal(b.dailyLimit, 80);
+  assert.match(b.note, /모든 모델에 실패 이력이 있다/);
+});
+
+test('강등 수가 풀보다 커도 음수가 되지 않는다 (기록이 풀 밖 모델을 가리킬 수 있다)', () => {
+  const b = budgetEstimate({ poolSize: 2, demotedCount: 7 });
+  assert.equal(b.usable, 0);
+  assert.equal(b.dailyLimit, 40);
+  assert.equal(b.allFailed, true);
+});
+
+test('빈 풀은 한도 0이다 (없는 모델로 한도를 만들어 내지 않는다)', () => {
+  const b = budgetEstimate({ poolSize: 0, demotedCount: 0 });
+  assert.equal(b.dailyLimit, 0);
+  assert.equal(b.allFailed, false);
+});
+
+test('모델당 한도 기본값은 실측치 20이다', () => {
+  assert.equal(budgetEstimate({ poolSize: 1, demotedCount: 0 }).dailyLimit, DEFAULT_DAILY_LIMIT);
 });
