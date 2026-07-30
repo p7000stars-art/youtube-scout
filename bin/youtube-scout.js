@@ -8,7 +8,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, mkdir, appendFile, access } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, appendFile, access, readdir } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -31,7 +31,16 @@ import {
   MAX_RETRIES,
   CALL_INTERVAL_MS,
 } from '../src/quota.js';
-import { segFileName, segDocument, harnessName, harnessHash, today } from '../src/output.js';
+import {
+  segFileName,
+  segDocument,
+  harnessName,
+  harnessHash,
+  today,
+  videoFolderName,
+  matchVideoFolder,
+  PARTS_DIR,
+} from '../src/output.js';
 import { mergeVideo } from '../src/merge.js';
 import { fetchAvailableModels, reconcilePool, reconcileMessages } from '../src/models.js';
 import { initRunDir, RUN_DIR_NAME, RUN_BAT_NAME, RUN_SH_NAME, LINKS_NAME } from '../src/init.js';
@@ -340,8 +349,31 @@ async function runInit(p) {
  * }} p
  */
 async function runVideo(p) {
-  const dir = join(p.outDir, p.meta.id);
-  await mkdir(dir, { recursive: true });
+  // 폴더 결정. 이름 생성·판정은 코어(output.js)가 하고 디렉터리 나열만 여기서 한다.
+  //
+  // 이미 이 영상의 폴더가 있으면 이름이 어떻든 **그 폴더를 그대로 쓴다.** 제목이 바뀌었다고
+  // 새 폴더를 만들면 이미 뽑아 둔 구간이 이전 폴더에 고립되고, 한도 20회 환경에서
+  // 재개 불가는 곧 실패다. 폴더명을 예쁘게 맞추는 것보다 재개가 우선이다.
+  /** @type {string[]} */
+  let outEntries = [];
+  try {
+    outEntries = (await readdir(p.outDir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    // out을 읽지 못하면 신규로 간주한다. 아래 mkdir이 실제 문제를 드러낸다.
+  }
+  const existing = matchVideoFolder(outEntries, p.meta.id);
+  const folder = existing ?? videoFolderName(p.meta.title, p.meta.id);
+  const dir = join(p.outDir, folder);
+
+  // 새 구간은 parts/ 아래에 쓴다 — 최상위에는 최종본만 남겨 무엇을 열지 구조가 말하게 한다.
+  const partsDir = join(dir, PARTS_DIR);
+  await mkdir(partsDir, { recursive: true });
+
+  // 구간을 찾을 곳: parts/ 우선, 그다음 폴더 최상위(구형 배치).
+  // 구형 폴더에서 재개하면 이전에 최상위에 쓴 구간들이 여기서 인식된다.
+  const segDirs = [partsDir, dir];
 
   let model = p.model;
   /** @type {Set<string>} 실제로 사용된 모델. 구간마다 다를 수 있어 frontmatter에 모두 남긴다 */
@@ -353,11 +385,20 @@ async function runVideo(p) {
   let carriedOver = false;
 
   for (const [i, r] of p.ranges.entries()) {
-    const file = join(dir, segFileName(r.start, r.end));
+    const segName = segFileName(r.start, r.end);
+    const file = join(partsDir, segName); // 새로 쓰는 위치는 항상 parts/
 
     // 재개: 이미 있는 구간은 건너뛴다. 중단된 배치를 처음부터 다시 돌리면
     // 쿼터를 두 번 쓰고, 한도가 20이면 두 번째 실행은 시작도 못 한다.
-    if (await exists(file)) {
+    // 구형 배치(폴더 최상위)에 있던 구간도 완료로 인정해야 재개가 유지된다.
+    let alreadyDone = false;
+    for (const d of segDirs) {
+      if (await exists(join(d, segName))) {
+        alreadyDone = true;
+        break;
+      }
+    }
+    if (alreadyDone) {
       skipped += 1;
       log(`   [${i + 1}/${p.ranges.length}] ${r.start}s-${r.end}s — 이미 완료, 건너뜀`);
       continue;
@@ -423,6 +464,7 @@ async function runVideo(p) {
 
   const merged = await mergeVideo({
     dir,
+    segDirs,
     ranges: p.ranges,
     url: p.meta.url,
     meta: {
@@ -445,7 +487,7 @@ async function runVideo(p) {
   });
 
   if (merged.fallback) {
-    log(`   ⚠️ _merged.md 를 쓰지 못해 대체 저장: ${merged.path}`);
+    log(`   ⚠️ 최종본을 쓰지 못해 대체 저장: ${merged.path}`);
   }
   for (const s of merged.strays) {
     log(`   ⚠️ 계획 밖 잔여 파일 (병합 제외): ${s}`);
