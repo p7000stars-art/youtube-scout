@@ -228,6 +228,101 @@ export function bar(done, total, width = 10) {
   return `[${'#'.repeat(filled)}${'-'.repeat(w - filled)}]`;
 }
 
+// ── 색상 ────────────────────────────────────────────────────────────
+/**
+ * ## 색은 강조일 뿐, 정보를 담지 않는다
+ * 색으로만 구분되는 정보를 만들지 않는다. 색맹 사용자, 색을 끈 환경, `_batch.log`를
+ * 나중에 읽는 사람 — 셋 다 같은 내용을 읽을 수 있어야 한다. 그래서 기존 기호(`✓ ⛔ ! ⚠️`)와
+ * 문구는 그대로 두고 거기에 색을 입히기만 한다.
+ *
+ * ## 파이프에는 한 바이트도 나가지 않는다
+ * ANSI 이스케이프가 리다이렉트 출력이나 로그 파일에 섞이면 기계로 읽는 쪽이 깨진다
+ * (스피너를 TTY로 제한한 것과 같은 규칙).
+ */
+
+/** SGR 코드. 최소한만 쓴다 — 팔레트를 늘리면 "어디를 봐야 하는가"가 다시 흐려진다. */
+const SGR = { cyan: '36', dim: '2', yellow: '33', green: '32', red: '31' };
+
+/**
+ * 색을 켤 것인가. 판정 근거를 전부 주입받아 테스트가 환경을 흉내 낼 수 있게 한다.
+ *
+ * 우선순위: `FORCE_COLOR=0`(명시적 끄기) > `NO_COLOR` > `FORCE_COLOR`(강제 켜기) > TTY.
+ * `NO_COLOR`는 사실상의 표준이다 — 값이 비어 있지 않기만 하면 끈다(값 자체는 보지 않는다).
+ *
+ * @param {{ env?: Record<string, string|undefined>, isTTY?: boolean }} [opts]
+ */
+export function colorEnabled(opts = {}) {
+  const { env = process.env, isTTY = process.stdout.isTTY } = opts;
+  if (env.FORCE_COLOR === '0') return false;
+  if (env.NO_COLOR) return false;
+  if (env.FORCE_COLOR) return true;
+  return Boolean(isTTY);
+}
+
+/**
+ * @typedef {object} Colors
+ * @property {boolean} enabled
+ * @property {(s: string) => string} cyan
+ * @property {(s: string) => string} dim
+ * @property {(s: string) => string} yellow
+ * @property {(s: string) => string} green
+ * @property {(s: string) => string} red
+ */
+
+/**
+ * 색 함수 묶음. **비활성이면 입력 문자열을 그대로 돌려준다** — 호출부에 조건문을 두지
+ * 않기 위해서다. 조건문이 흩어지면 언젠가 한 곳이 빠지고, 그 한 곳이 파이프 출력을 깨뜨린다.
+ *
+ * @param {boolean} [enabled]
+ * @returns {Colors}
+ */
+export function createColors(enabled = false) {
+  /** @param {string} code */
+  const wrap = (code) => (/** @type {string} */ s) =>
+    enabled ? `\x1b[${code}m${s}\x1b[0m` : String(s);
+
+  return {
+    enabled: Boolean(enabled),
+    cyan: wrap(SGR.cyan),
+    dim: wrap(SGR.dim),
+    yellow: wrap(SGR.yellow),
+    green: wrap(SGR.green),
+    red: wrap(SGR.red),
+  };
+}
+
+/** 색이 전혀 없는 묶음. 기본값으로 쓴다 — 색을 켜는 것이 명시적 선택이어야 한다. */
+export const NO_COLORS = createColors(false);
+
+/**
+ * 진행 막대에 색을 입힌다. 채운 칸은 청록, 남은 칸은 흐리게.
+ * 빈 문자열을 감싸지 않는다 — 0칸짜리 구간에 이스케이프만 남는 것을 막는다.
+ *
+ * @param {string} barText `bar()`가 만든 `[###-------]`
+ * @param {Colors} [colors]
+ */
+export function paintBar(barText, colors = NO_COLORS) {
+  const inner = String(barText).slice(1, -1);
+  const cut = inner.indexOf('-');
+  const filled = cut === -1 ? inner : inner.slice(0, cut);
+  const empty = cut === -1 ? '' : inner.slice(cut);
+  return `[${filled ? colors.cyan(filled) : ''}${empty ? colors.dim(empty) : ''}]`;
+}
+
+/**
+ * 경고·오류 줄에 색을 입힌다. **줄 전체를 칠한다** — 기호만 칠하면 스크롤 중에 눈에 걸리지
+ * 않는다. 타임스탬프가 붙어 있어도 판정되도록 접두를 벗겨 보고, 판정 대상이 아니면 원문 그대로다.
+ *
+ * @param {string} line
+ * @param {Colors} [colors]
+ */
+export function paintNotice(line, colors = NO_COLORS) {
+  const body = String(line).replace(/^\[\d{2}:\d{2}:\d{2}\]/, '').trimStart();
+  if (body.startsWith('⛔')) return colors.red(line);
+  if (body.startsWith('⚠️') || body.startsWith('!')) return colors.yellow(line);
+  return line;
+}
+
 /**
  * 배너·단계 줄에 쓰면 안 되는 문자.
  *
@@ -274,11 +369,19 @@ export function bannerArt(version) {
 }
 
 /**
- * 부팅 단계 한 줄의 모양. 로그 줄(`[HH:MM:SS] ...`)과 구분되게 들여쓰고 점을 붙인다.
+ * 부팅 단계 한 줄의 모양. 로그 줄(`[HH:MM:SS] ...`)과 구분되게 들여쓴다.
+ *
+ * 막대는 **실제로 끝난 단계 수**로만 채운다. 예상 소요를 보간하지 않는다 —
+ * `bar()`가 이미 "완료 전에는 절대 꽉 차지 않는다"를 보장하므로 그것을 그대로 쓴다.
+ *
  * @param {string} text
+ * @param {number} done  끝난 단계 수
+ * @param {number} total 전체 단계 수 (0이면 막대 없이 점만)
+ * @param {Colors} [colors]
  */
-export function formatBootStep(text) {
-  return `  · ${text}`;
+export function formatBootStep(text, done = 0, total = 0, colors = NO_COLORS) {
+  if (!(total > 0)) return `  · ${text}`;
+  return `  ${paintBar(bar(done, total), colors)} ${text}`;
 }
 
 /**
@@ -298,11 +401,17 @@ export function formatBootStep(text) {
  * 시작을 알리는 API를 두지 않았다 — 있으면 언젠가 "곧 끝날 것"을 미리 출력하게 된다.
  * 예상을 그럴듯하게 채우지 않는다는 원칙(이 파일 머리말)을 구조로 못 박은 것이다.
  *
- * @param {{ out?: (line: string) => void, enabled?: boolean }} [opts]
+ * @param {{
+ *   out?: (line: string) => void,
+ *   enabled?: boolean,
+ *   total?: number,
+ *   colors?: Colors,
+ * }} [opts]
  *   `enabled`가 false면 한 줄도 내지 않는다 (파이프·리다이렉트에는 표시를 보내지 않는다).
+ *   `total`을 주면 각 줄 앞에 채워지는 막대가 붙는다.
  */
 export function createBootSteps(opts = {}) {
-  const { out = () => {}, enabled = true } = opts;
+  const { out = () => {}, enabled = true, total = 0, colors = NO_COLORS } = opts;
   /** @type {string[]} */
   const done = [];
 
@@ -313,7 +422,7 @@ export function createBootSteps(opts = {}) {
      */
     finish(text) {
       done.push(text);
-      if (enabled) out(formatBootStep(text));
+      if (enabled) out(formatBootStep(text, done.length, total, colors));
     },
     /** 지금까지 끝난 단계들 (테스트·디버깅용) */
     get steps() {

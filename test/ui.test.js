@@ -10,6 +10,11 @@ import {
   bannerArt,
   createBootSteps,
   formatBootStep,
+  createColors,
+  colorEnabled,
+  paintBar,
+  paintNotice,
+  NO_COLORS,
   BANNER_WIDTH,
   FRAMES,
   FRAME_MS,
@@ -319,4 +324,146 @@ test('out을 주지 않아도 던지지 않는다', () => {
   const boot = createBootSteps();
   boot.finish('상태 파일 읽기');
   assert.deepEqual(boot.steps, ['상태 파일 읽기']);
+});
+
+// ── 색상 ────────────────────────────────────────────────────────────
+//
+// 색은 강조일 뿐이다. 색으로만 구분되는 정보를 만들지 않는다 — 색맹 사용자, 색을 끈 환경,
+// 로그 파일을 나중에 읽는 사람이 모두 같은 내용을 읽을 수 있어야 한다.
+
+test('비활성이면 입력 문자열을 그대로 돌려준다', () => {
+  const c = createColors(false);
+  for (const fn of [c.cyan, c.dim, c.yellow, c.green, c.red]) {
+    assert.equal(fn('추출 중'), '추출 중');
+    assert.ok(!fn('추출 중').includes('\x1b'), '이스케이프 0바이트');
+  }
+  assert.equal(c.enabled, false);
+});
+
+test('활성이면 앞뒤로 이스케이프가 붙고 원문이 보존된다', () => {
+  const c = createColors(true);
+  assert.equal(c.cyan('x'), '\x1b[36mx\x1b[0m');
+  assert.equal(c.dim('x'), '\x1b[2mx\x1b[0m');
+  assert.equal(c.yellow('x'), '\x1b[33mx\x1b[0m');
+  assert.equal(c.green('x'), '\x1b[32mx\x1b[0m');
+  assert.equal(c.red('x'), '\x1b[31mx\x1b[0m');
+  // 색을 벗기면 원문이 그대로다 = 색이 정보를 바꾸지 않는다
+  assert.equal(c.green('✓').replace(/\x1b\[\d+m/g, ''), '✓');
+});
+
+test('기본 묶음(NO_COLORS)은 색이 없다', () => {
+  assert.equal(NO_COLORS.enabled, false);
+  assert.equal(NO_COLORS.red('⛔'), '⛔');
+});
+
+// ── 색 켜기 판정 ────────────────────────────────────────────────────
+
+test('TTY면 켜고 아니면 끈다', () => {
+  assert.equal(colorEnabled({ env: {}, isTTY: true }), true);
+  assert.equal(colorEnabled({ env: {}, isTTY: false }), false);
+  assert.equal(colorEnabled({ env: {}, isTTY: undefined }), false);
+});
+
+test('NO_COLOR가 있으면 TTY라도 끈다 (사실상의 표준)', () => {
+  // 값은 보지 않는다 — 비어 있지 않기만 하면 끈다.
+  assert.equal(colorEnabled({ env: { NO_COLOR: '1' }, isTTY: true }), false);
+  assert.equal(colorEnabled({ env: { NO_COLOR: 'anything' }, isTTY: true }), false);
+  assert.equal(colorEnabled({ env: { NO_COLOR: '' }, isTTY: true }), true, '빈 값은 설정되지 않은 것');
+});
+
+test('FORCE_COLOR=0은 명시적 끄기라 무엇보다 우선한다', () => {
+  assert.equal(colorEnabled({ env: { FORCE_COLOR: '0' }, isTTY: true }), false);
+  assert.equal(colorEnabled({ env: { FORCE_COLOR: '0', NO_COLOR: '' }, isTTY: true }), false);
+});
+
+test('FORCE_COLOR는 비TTY에서도 켠다', () => {
+  assert.equal(colorEnabled({ env: { FORCE_COLOR: '1' }, isTTY: false }), true);
+  // 다만 NO_COLOR가 더 세다
+  assert.equal(colorEnabled({ env: { FORCE_COLOR: '1', NO_COLOR: '1' }, isTTY: false }), false);
+});
+
+// ── 막대 색칠 ───────────────────────────────────────────────────────
+
+test('채운 칸은 청록, 남은 칸은 흐리게', () => {
+  const c = createColors(true);
+  assert.equal(paintBar('[###-------]', c), `[${c.cyan('###')}${c.dim('-------')}]`);
+});
+
+test('빈 구간은 감싸지 않는다 (이스케이프만 남는 것을 막는다)', () => {
+  const c = createColors(true);
+  assert.equal(paintBar('[----------]', c), `[${c.dim('----------')}]`);
+  assert.equal(paintBar('[##########]', c), `[${c.cyan('##########')}]`);
+});
+
+test('색이 꺼져 있으면 막대가 원문 그대로다', () => {
+  assert.equal(paintBar('[###-------]'), '[###-------]');
+  assert.equal(paintBar('[###-------]', createColors(false)), '[###-------]');
+});
+
+// ── 경고 줄 색칠 ────────────────────────────────────────────────────
+
+test('⛔ 줄은 빨강, ⚠️·! 줄은 노랑, 나머지는 그대로', () => {
+  const c = createColors(true);
+  assert.equal(paintNotice('   ⛔ 누락 구간 1개', c), c.red('   ⛔ 누락 구간 1개'));
+  assert.equal(paintNotice('⚠️ 산출물은 미검증 상태다', c), c.yellow('⚠️ 산출물은 미검증 상태다'));
+  assert.equal(paintNotice('! gemini-2.5-flash — 실패 이력', c), c.yellow('! gemini-2.5-flash — 실패 이력'));
+  assert.equal(paintNotice('메타 조회 (1편)', c), '메타 조회 (1편)');
+});
+
+test('타임스탬프가 붙어 있어도 판정된다 (로그 줄 형식)', () => {
+  const c = createColors(true);
+  const line = '[12:34:56] ! gemini-2.5-flash — 실패 이력';
+  assert.equal(paintNotice(line, c), c.yellow(line));
+});
+
+test('색이 꺼져 있으면 경고 줄도 원문 그대로다', () => {
+  assert.equal(paintNotice('   ⛔ 누락 구간 1개'), '   ⛔ 누락 구간 1개');
+  assert.equal(paintNotice('[12:34:56] ⚠️ 경고'), '[12:34:56] ⚠️ 경고');
+});
+
+// ── 부팅 막대 ───────────────────────────────────────────────────────
+
+test('단계가 진행될수록 막대가 채워진다 (끝난 수만큼)', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l), total: 5 });
+
+  const labels = ['상태 파일 읽기', '모델 목록 조회 (15종)', '모델 대조 (15종, 강등 5)', '메타 조회 1/1', '준비 완료'];
+  for (const l of labels) boot.finish(l);
+
+  assert.deepEqual(out, [
+    '  [##--------] 상태 파일 읽기',
+    '  [####------] 모델 목록 조회 (15종)',
+    '  [######----] 모델 대조 (15종, 강등 5)',
+    '  [########--] 메타 조회 1/1',
+    '  [##########] 준비 완료',
+  ]);
+});
+
+test('마지막 단계에서만 막대가 꽉 찬다 (완료 전 꽉 참은 거짓 정보)', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l), total: 5 });
+  for (let i = 0; i < 4; i += 1) boot.finish(`단계 ${i}`);
+  assert.ok(!out.some((l) => l.includes('##########')), '4/5에서는 꽉 차지 않는다');
+});
+
+test('total을 주지 않으면 종전처럼 점 불릿이다', () => {
+  assert.equal(formatBootStep('상태 파일 읽기'), '  · 상태 파일 읽기');
+  assert.equal(formatBootStep('상태 파일 읽기', 1, 0), '  · 상태 파일 읽기');
+});
+
+test('부팅 막대에 색을 입혀도 막대 구조는 그대로다', () => {
+  const c = createColors(true);
+  const line = formatBootStep('상태 파일 읽기', 1, 5, c);
+  assert.ok(line.includes('\x1b['), '색이 들어갔다');
+  assert.equal(line.replace(/\x1b\[\d+m/g, ''), '  [##--------] 상태 파일 읽기');
+});
+
+test('색이 꺼진 부팅 막대에는 이스케이프가 0바이트다', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l), total: 5 });
+  boot.finish('상태 파일 읽기');
+  assert.ok(!out.join('').includes('\x1b'));
 });
