@@ -10,6 +10,7 @@ import {
   bannerArt,
   createBootSteps,
   formatBootStep,
+  formatBatchTotals,
   createColors,
   colorEnabled,
   paintBar,
@@ -466,4 +467,33 @@ test('색이 꺼진 부팅 막대에는 이스케이프가 0바이트다', () =>
   const boot = createBootSteps({ out: (l) => out.push(l), total: 5 });
   boot.finish('상태 파일 읽기');
   assert.ok(!out.join('').includes('\x1b'));
+});
+
+// ── 배치 규모 표기 ──────────────────────────────────────────────────
+
+test('영상 수·청크 수·토큰을 한 줄로 만든다', () => {
+  assert.equal(
+    formatBatchTotals({ videos: 2, chunks: 3, tokens: 147395 }),
+    '영상 2편 · 3청크 · 147,395 토큰',
+  );
+});
+
+test('토큰은 세 자리마다 끊는다 (여섯 자리를 맨눈으로 읽게 하지 않는다)', () => {
+  assert.ok(formatBatchTotals({ videos: 1, chunks: 1, tokens: 1234567 }).includes('1,234,567 토큰'));
+  assert.ok(formatBatchTotals({ videos: 1, chunks: 1, tokens: 999 }).includes('999 토큰'));
+});
+
+test('토큰이 0이거나 없으면 아예 뺀다 (0은 "안 썼다"가 아니다)', () => {
+  assert.equal(formatBatchTotals({ videos: 1, chunks: 1, tokens: 0 }), '영상 1편 · 1청크');
+  assert.equal(formatBatchTotals({ videos: 1, chunks: 1 }), '영상 1편 · 1청크');
+});
+
+test('이상한 입력에도 형태를 유지한다', () => {
+  assert.equal(formatBatchTotals({ videos: -3, chunks: -1, tokens: NaN }), '영상 0편 · 0청크');
+  // @ts-expect-error 의도적으로 잘못된 타입
+  assert.match(formatBatchTotals({}), /^영상 0편 · 0청크$/);
+});
+
+test('배치 규모 표기에는 색이 없다 (색은 호출부가 시간에만 입힌다)', () => {
+  assert.ok(!formatBatchTotals({ videos: 2, chunks: 3, tokens: 100 }).includes('\x1b'));
 });

@@ -71,6 +71,7 @@ import {
   createColors,
   colorEnabled,
   paintNotice,
+  formatBatchTotals,
 } from './ui.js';
 import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
@@ -164,6 +165,27 @@ const colors = createColors(colorEnabled());
 /** 부팅 단계 수: 상태 파일 읽기 → 목록 조회 → 대조 → 메타 조회 → 준비 완료 */
 const BOOT_STEPS = 5;
 
+/**
+ * 프로세스 시작 시각. **사용자가 체감하는 것은 더블클릭부터 끝날 때까지**이므로
+ * 부팅·메타 조회를 포함해 여기서 잰다 (추출 구간만 재면 실제보다 짧게 보고하게 된다).
+ */
+const START_MS = Date.now();
+
+/**
+ * 시간 표기 색. **한 종류로 통일한다** — 시간은 어디에 나오든 시간으로 보여야 한다.
+ *
+ * ## 왜 확정된 줄에도 색을 유지하는가 (실사용 관찰 2026-07-31)
+ * 예전에는 진행 중일 때만 노랑이었고 줄이 확정되면 흰색으로 돌아갔다. 강조가 필요한
+ * 시점이 정확히 반대다 — 이 도구의 값어치는 "10분 영상을 1~2분 만에 회의 자료로 바꾼다"는
+ * 것이고, 사용자가 그것을 체감하는 유일한 지표가 **지나간 시간**이다. 디버깅(어느 모델이
+ * 느린가, 어디서 시간을 태웠나)에도 같은 숫자를 쓴다.
+ *
+ * @param {number|string} v ms 숫자 또는 이미 만든 표기
+ */
+function timeText(v) {
+  return colors.yellow(typeof v === 'number' ? fmtSec(v) : String(v));
+}
+
 /** @param {string} msg */
 function stamp(msg) {
   const d = new Date();
@@ -190,13 +212,22 @@ function flushLog() {
   return logWriter.flush();
 }
 
-/** @param {string} msg */
-function log(msg) {
-  const line = stamp(msg);
+/**
+ * 화면과 파일에 함께 남긴다.
+ *
+ * **색이 들어간 문자열을 파일에 쓰지 않는다.** 색을 문구에 미리 섞으면 그 문자열이 그대로
+ * 파일로 흘러가 이스케이프가 로그에 박힌다(이 작업에서 실제로 그렇게 만들 뻔했다).
+ * 그래서 색이 필요한 줄은 파일용 원문과 화면용 문구를 따로 받는다.
+ *
+ * @param {string} msg 파일에 남을 원문 (색 없음)
+ * @param {string} [screenMsg] 화면에 낼 문구. 생략하면 원문을 paintNotice로 칠한다
+ */
+function log(msg, screenMsg) {
+  // 시각은 한 번만 만든다. 두 번 부르면 화면과 파일의 초가 갈릴 수 있다.
+  const prefix = stamp('');
+  const line = `${prefix}${msg}`;
   activeSpinner?.clear();
-  // 색은 화면에만. 파일에 이스케이프가 들어가면 사후 파싱이 깨지고, 무엇보다
-  // 로그를 근거로 쓰는 사람이 원문을 못 읽게 된다.
-  console.log(paintNotice(line, colors));
+  console.log(screenMsg == null ? paintNotice(line, colors) : `${prefix}${screenMsg}`);
   logFile(line);
 }
 
@@ -230,7 +261,7 @@ async function waitVisible(ms, label) {
 
   const until = Date.now() + ms;
   // 프레임 문자를 쓰지 않는다 — 남은 시간이 줄어드는 것 자체가 살아있다는 신호다.
-  const sp = spinner(() => `   ${label} ${fmtSec(Math.max(0, until - Date.now()))} 남음`);
+  const sp = spinner(() => `   ${label} ${timeText(Math.max(0, until - Date.now()))} 남음`);
   activeSpinner = sp;
   try {
     await sleep(ms);
@@ -639,7 +670,7 @@ async function runVideo(p) {
     const sp = spinner(
       // 경과 시간만 색을 준다 — 침묵이 길어질 때 눈이 가야 할 곳이 거기다.
       // 프레임 문자는 기본색으로 둔다(움직임 자체가 이미 신호다).
-      (frame) => `${prefix}${body(shownModel)} ${frame} ${colors.yellow(fmtSec(Date.now() - t0))}`,
+      (frame) => `${prefix}${body(shownModel)} ${frame} ${timeText(Date.now() - t0)}`,
     );
     activeSpinner = sp.active ? sp : null;
     if (!sp.active) console.log(startLine);
@@ -678,14 +709,20 @@ async function runVideo(p) {
       );
       done += 1;
       tokens += res.tokens;
-      const line = stamp(`      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰, ${took})`);
-      sp.done(line); // TTY면 스피너 줄을 이 줄로 확정, 아니면 그냥 출력
-      logFile(line);
+      // 화면용과 파일용을 따로 만든다 — 색이 섞인 문자열이 파일로 가면 안 된다.
+      const at = stamp('');
+      const saved = /** @param {string} t */ (t) =>
+        `      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰, ${t})`;
+      sp.done(`${at}${saved(timeText(took))}`); // TTY면 스피너 줄을 이 줄로 확정
+      logFile(`${at}${saved(took)}`);
     } else {
       failed += 1;
-      const line = stamp(`      실패: ${res.reason} (${took})`);
-      sp.done(line);
-      logFile(line);
+      const at = stamp('');
+      const failed = /** @param {string} t */ (t) => `      실패: ${res.reason} (${t})`;
+      // 실패는 빨강, 시간은 시간색. 한 줄에 두 색이 섞이는 것은 의도된 것이다 —
+      // "무엇이 실패했나"와 "얼마나 태웠나"는 따로 읽혀야 하는 정보다.
+      sp.done(`${at}${colors.red('      실패:')} ${res.reason} (${timeText(took)})`);
+      logFile(`${at}${failed(took)}`);
       if (res.poolEmpty) {
         // 쓸 수 있는 모델이 하나도 남지 않았다. 남은 구간을 계속 시도해도 같은 결과이므로
         // 헛손질을 하지 않고 다음 실행으로 이월한다.
@@ -1051,6 +1088,8 @@ async function main() {
   // 1편·1청크뿐이면 바 하나가 통째로 노이즈라 생략한다.
   const showBatchBar = batch.totalCalls > 1;
   let doneChunks = 0;
+  /** 배치 전체 토큰. 총 소요 줄 옆에 "무엇을 하느라 걸린 시간인가"를 붙이기 위해 센다. */
+  let totalTokens = 0;
 
   for (const [i, p] of batch.plans.entries()) {
     const meta = playable.find((m) => m.id === p.id);
@@ -1073,6 +1112,7 @@ async function main() {
     });
 
     doneChunks += r.merged.okChunks;
+    totalTokens += r.tokens;
     if (showBatchBar) {
       log(`   진행: ${bar(doneChunks, batch.totalCalls)} ${doneChunks}/${batch.totalCalls} 청크`);
     }
@@ -1109,6 +1149,14 @@ async function main() {
     // 퇴역은 RPD와 해법이 다르다 — 내일도 안 된다. run 파일/--models에서 빼는 게 답이다.
     show(`  퇴역(404) 모델: ${[...pool.dead].join(', ')} — 내일도 사용 불가. --models 또는 run 파일에서 제거를 권장한다`);
   }
+  if (pool.overloaded.size) {
+    // 네 번째 해법이다. RPD는 내일, 퇴역은 제거, 구조적 TPM은 청크 축소, 이건 그냥 잠시 후.
+    // 상태 파일에도 남기지 않으므로 "다음 실행이 달라진다"는 예고가 아니라 이번 실행의 사실이다.
+    show(
+      `  서버 과부하(503)로 이번 실행에서 제외된 모델: ${[...pool.overloaded].join(', ')} — ` +
+      `잠시 후 다시 실행하면 쓸 수 있다 (기록에 남기지 않았다)`,
+    );
+  }
   if (pool.tpmBlocked.size) {
     // 세 번째 해법이다. RPD는 내일, 퇴역은 제거, 이건 청크 축소.
     // 뭉쳐서 안내하면 사용자가 엉뚱한 조치를 한다.
@@ -1126,6 +1174,15 @@ async function main() {
   if (statusEntries.length) {
     show(`  모델 상태 파일: ${statusPath} (줄을 지우면 그 모델이 복권된다)`);
   }
+  // 총 소요. **로그 파일에도 남긴다** — 배치 성능 추적의 근거이고, 화면은 스크롤로 사라진다.
+  // 색은 화면에만 붙는다(log()가 파일에는 원문을 쓴다).
+  const totals = formatBatchTotals({
+    videos: summary.length,
+    chunks: doneChunks,
+    tokens: totalTokens,
+  });
+  const elapsed = fmtSec(Date.now() - START_MS);
+  log(`총 소요: ${elapsed}  (${totals})`, `총 소요: ${timeText(elapsed)}  (${totals})`);
   show(`  산출물: ${outDir}`);
   show(`  로그:   ${logPath}`);
   show('');
