@@ -11,7 +11,7 @@
  */
 
 import { extractChunk, ExtractError } from '../src/extract.js';
-import { parse429, quotaMessage, forbiddenMessage, MAX_RETRIES, sleep } from '../src/quota.js';
+import { parse429, quotaMessage, forbiddenMessage, sleep } from '../src/quota.js';
 
 /**
  * TPM 경로에서 한 모델에 주는 시도 횟수. **2시도 = 초기 1회 + 재시도 1회(대기 1번).**
@@ -28,10 +28,28 @@ import { parse429, quotaMessage, forbiddenMessage, MAX_RETRIES, sleep } from '..
  * 그래서 2번째 TPM을 판정 시점으로 삼는다. 첫 대기를 남겨 두는 이유는 진짜 일시 혼잡
  * (다른 프로세스가 같은 키를 쓰는 경우 등)과 구별하기 위해서다 — 한 번은 봐준다.
  *
- * 5xx 경로는 성질이 다르므로 그대로 `MAX_RETRIES`(3회)를 쓴다. 서버 혼잡은 시간이
- * 실제로 해결해 주는 문제다.
+ * 5xx도 같은 구조를 쓴다 — 근거는 `SERVER_MAX_ATTEMPTS` 주석에 있다.
  */
 const TPM_MAX_ATTEMPTS = 2;
+
+/**
+ * 5xx 경로에서 한 모델에 주는 시도 횟수. **2시도 = 초기 1회 + 재시도 1회(대기 1번).**
+ *
+ * ## 왜 3회에서 1회로 줄였는가 (실측 2026-07-31)
+ * 예전 근거는 "서버 혼잡은 시간이 실제로 해결해 주는 문제"였다. 실측이 그것을 반증했다 —
+ * 2청크 영상이 `gemini-3.5-flash`에서 10초·20초·30초 대기를 모두 지키고도 계속 503이었고
+ * 두 구간 모두 실패했다. 같은 모델은 대기 후에도 계속 503이다.
+ *
+ * 그리고 대기는 비싸다. 503 응답 자체가 약 50초씩 걸려(실측) 3회 재시도는 모델당 4분에
+ * 가깝다. 실제로 그 실행은 6분 39초를 쓰고 산출물 0개로 끝났다 — 가용 모델이 10종
+ * 남아 있었는데도. **교체가 대기보다 압도적으로 싸다.**
+ *
+ * 한 번은 봐주는 이유는 TPM과 같다: 진짜 일시 혼잡과 구별하기 위해서다.
+ */
+const SERVER_MAX_ATTEMPTS = 2;
+
+/** 5xx 재시도 대기. 한 번뿐이라 점증시킬 이유가 없다. */
+const SERVER_RETRY_MS = 10_000;
 
 /**
  * @typedef {{ ok: true, text: string, tokens: number, model: string }} ChunkOk
@@ -68,6 +86,13 @@ const TPM_MAX_ATTEMPTS = 2;
  * 판정에 3회 재시도가 필요하지 않다는 것이 실측으로 드러났다. 근거는 `TPM_MAX_ATTEMPTS`
  * 주석에 있다. 요약하면 — 단일 사용 키에서 권고 대기 후에도 TPM이면 분당 창이 비었는데도
  * 막힌 것이므로 요청이 한도보다 크다는 뜻이고, 더 기다려도 결과가 바뀌지 않는다.
+ *
+ * ## 5xx 재시도 소진도 청크 실패가 아니다 (버그 수정 2026-07-31)
+ * 429 경로를 위와 같이 고쳤을 때 5xx 경로에는 같은 결함이 남아 있었다. 당시 근거였던
+ * "서버 혼잡은 시간이 해결한다"가 실측으로 반증됐다 — 대기를 모두 지키고도 같은 모델은
+ * 계속 503이었고, 가용 모델 10종을 안 써 보고 6분 39초를 태운 뒤 0/2로 끝났다.
+ * 이제 5xx도 한 번만 기다리고 교체한다. 다만 **상태 파일에는 남기지 않는다** —
+ * 503은 모델의 속성이 아니라 그 순간 서버 사정이라 다음 실행까지 끌고 갈 관찰이 아니다.
  *
  * ## 제외 판정은 `onFailure`로 밖에 알린다
  * 여기서 내리는 세 판정(404·RPD·구조적 TPM)은 다음 실행에도 유효한 관찰이다. 그런데
@@ -221,12 +246,35 @@ export async function runChunk(p) {
         return { ok: false, daily: false, poolEmpty: false, reason: forbiddenMessage(), model };
       }
 
-      // 5xx는 일시적 혼잡일 수 있다. TPM과 같은 상한 안에서만 재시도한다.
-      if (e.status >= 500 && attempt <= MAX_RETRIES) {
-        const ms = Math.min(attempt * 10_000, 90_000);
-        log(`      HTTP ${e.status} — ${ms / 1000}초 후 재시도 (${attempt}/${MAX_RETRIES})`);
-        await wait(ms, '서버 혼잡 대기 중...');
-        attempt += 1;
+      if (e.status >= 500) {
+        // 한 번은 기다려 본다 (진짜 일시 혼잡과 구별하기 위해 — TPM과 같은 구조).
+        if (attempt < SERVER_MAX_ATTEMPTS) {
+          const ms = SERVER_RETRY_MS;
+          log(`      HTTP ${e.status} — ${ms / 1000}초 후 재시도 (${attempt}/${SERVER_MAX_ATTEMPTS - 1})`);
+          await wait(ms, '서버 혼잡 대기 중...');
+          attempt += 1;
+          continue;
+        }
+
+        // 대기 후에도 5xx → 이 모델의 과부하로 보고 교체한다.
+        // **상태 파일에 남기지 않는다** — 503은 모델의 속성이 아니라 그 순간 서버 사정이다
+        // (근거는 ModelPool.overloaded 주석). 그래서 onFailure를 부르지 않는다.
+        const busy = model;
+        const next = pool.markOverloaded(busy);
+        log(
+          `      HTTP ${e.status} 재발 — 모델 '${busy}'의 서버 과부하로 판단. ` +
+          `대기 대신 교체한다 (이번 실행에서만 제외. 잠시 후 다시 실행하면 쓸 수 있다).`,
+        );
+        if (!swapTo(next)) {
+          return {
+            ok: false,
+            daily: false,
+            poolEmpty: true,
+            reason: `HTTP ${e.status} 서버 과부하 (사용 가능한 모델 없음)`,
+            model: busy,
+          };
+        }
+        if (swaps > maxSwaps) return tooManySwaps(model, maxSwaps);
         continue;
       }
 

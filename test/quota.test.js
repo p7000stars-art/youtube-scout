@@ -180,3 +180,39 @@ test('기본 상수는 실측치', () => {
   assert.equal(MAX_RETRIES, 3);
   assert.equal(CALL_INTERVAL_MS, 6_000);
 });
+
+// ── 서버 과부하(503) 제외 ───────────────────────────────────────────
+//
+// 네 번째 제외 집합인 이유는 해법이 다르기 때문이다:
+//   exhausted(RPD) 내일 / dead(404) 영구 / tpmBlocked 청크 축소 / overloaded 잠시 후
+
+test('ModelPool: 과부하 모델은 이번 실행 동안 제외되고 대체 모델을 준다', () => {
+  const pool = new ModelPool(['a', 'b', 'c']);
+  assert.equal(pool.markOverloaded('a'), 'b', '우선순위 순으로 대체한다');
+  assert.deepEqual(pool.available(), ['b', 'c']);
+  assert.ok(pool.overloaded.has('a'));
+});
+
+test('ModelPool: 과부하 집합은 다른 세 집합과 섞이지 않는다 (안내 문구가 다르다)', () => {
+  const pool = new ModelPool(['a', 'b']);
+  pool.markOverloaded('a');
+  assert.equal(pool.exhausted.size, 0, 'RPD 아님 — 내일 얘기가 아니다');
+  assert.equal(pool.dead.size, 0, '퇴역 아님 — 목록에서 뺄 일이 아니다');
+  assert.equal(pool.tpmBlocked.size, 0, '구조적 TPM 아님 — 청크 축소로 풀 일이 아니다');
+});
+
+test('ModelPool: 전 모델이 과부하면 대체 모델이 없다', () => {
+  const pool = new ModelPool(['a', 'b']);
+  pool.markOverloaded('a');
+  assert.equal(pool.markOverloaded('b'), null);
+  assert.deepEqual(pool.available(), []);
+  assert.equal(pool.assign(), null);
+});
+
+test('ModelPool: 과부하와 다른 제외가 겹쳐도 가용 목록이 정확하다', () => {
+  const pool = new ModelPool(['a', 'b', 'c', 'd']);
+  pool.markOverloaded('a');
+  pool.markDead('b');
+  pool.markExhausted('c');
+  assert.deepEqual(pool.available(), ['d']);
+});

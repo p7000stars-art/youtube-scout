@@ -130,6 +130,21 @@ export class ModelPool {
      * @type {Set<string>}
      */
     this.tpmBlocked = new Set();
+    /**
+     * 서버 과부하(5xx)를 반복해서 맞은 모델. **네 번째 집합인 이유도 해법이 다르기 때문이다.**
+     *   exhausted(RPD) → 내일
+     *   dead(404)      → 영구. 목록에서 제거
+     *   tpmBlocked     → 청크를 줄이면 쓸 수 있다
+     *   overloaded     → 잠시 후 다시 실행하면 쓸 수 있다 (분 단위)
+     *
+     * ## 왜 상태 파일에 기록하지 않는가 (실측 2026-07-31)
+     * 503은 **모델의 속성이 아니라 그 순간 서버 사정**이다. 404(영구 퇴역)나 구조적 TPM
+     * (모델 용량 < 요청 크기)과 달리 다음 실행에도 유효한 관찰이 아니다. 기록하면 멀쩡한
+     * 모델이 내일 강등된 채로 시작한다 — rpd 기록을 자정에 소거하는 것과 같은 판단이고,
+     * 이쪽은 아예 남기지 않는 것이 맞다(회복이 분 단위라 날짜로 거를 수도 없다).
+     * @type {Set<string>}
+     */
+    this.overloaded = new Set();
     /** 영상 단위 순환 커서 */
     this.cursor = 0;
   }
@@ -137,7 +152,11 @@ export class ModelPool {
   /** 아직 쓸 수 있는 모델 목록 */
   available() {
     return this.models.filter(
-      (m) => !this.exhausted.has(m) && !this.dead.has(m) && !this.tpmBlocked.has(m),
+      (m) =>
+        !this.exhausted.has(m) &&
+        !this.dead.has(m) &&
+        !this.tpmBlocked.has(m) &&
+        !this.overloaded.has(m),
     );
   }
 
@@ -208,6 +227,25 @@ export class ModelPool {
    */
   markTpmBlocked(model) {
     this.tpmBlocked.add(model);
+    return this.nextAvailable();
+  }
+
+  /**
+   * 서버 과부하(5xx) 처리 후 대체 모델을 돌려준다.
+   *
+   * ## 왜 기다리지 않고 교체하는가 (실측 2026-07-31)
+   * 예전 근거는 "서버 혼잡은 시간이 해결한다"였고, 그 전제로 5xx만 3회까지 재시도한 뒤
+   * 청크를 실패시켰다. 실측이 그 전제를 반증했다 — 2청크 영상이 `gemini-3.5-flash`에서
+   * 10초·20초·30초 대기를 모두 지키고도 계속 503이었고, 두 구간 모두 실패했다.
+   * **가용 모델이 10종 남아 있었는데 한 번도 교체되지 않았다.** 6분 39초를 쓰고 산출물 0개.
+   *
+   * Gemini의 503은 대개 **그 모델의** 과부하다. 그러면 해법은 시간이 아니라 다른 모델이고,
+   * 교체가 대기보다 압도적으로 싸다(503 응답까지만 약 50초씩 걸린다).
+   * @param {string} model
+   * @returns {string|null}
+   */
+  markOverloaded(model) {
+    this.overloaded.add(model);
     return this.nextAvailable();
   }
 }

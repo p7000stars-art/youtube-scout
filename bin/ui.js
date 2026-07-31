@@ -432,6 +432,25 @@ export function createBootSteps(opts = {}) {
 }
 
 /**
+ * 배치 규모 한 줄. 총 소요 시간 옆에 붙어 "무엇을 하느라 걸린 시간인가"를 말한다.
+ * 시간만 있으면 빠른지 느린지 판단할 근거가 없다 — 3청크에 2분과 30청크에 2분은 다른 사실이다.
+ *
+ * 토큰은 세 자리마다 끊는다. 여섯 자리 숫자를 맨눈으로 읽게 하지 않는다.
+ * 0이면 아예 빼는데, 0 토큰은 "안 썼다"가 아니라 대개 "집계할 것이 없었다"이기 때문이다.
+ *
+ * @param {{ videos: number, chunks: number, tokens?: number }} p
+ * @returns {string} 예: `영상 2편 · 3청크 · 147,395 토큰`
+ */
+export function formatBatchTotals(p) {
+  const parts = [`영상 ${Math.max(0, p.videos ?? 0)}편`, `${Math.max(0, p.chunks ?? 0)}청크`];
+  const tokens = Number(p.tokens ?? 0);
+  if (Number.isFinite(tokens) && tokens > 0) {
+    parts.push(`${Math.round(tokens).toLocaleString('en-US')} 토큰`);
+  }
+  return parts.join(' · ');
+}
+
+/**
  * 경과·잔여 시간 표기. 초 미만은 버린다 (밀리초는 사람이 읽을 정보가 아니다).
  *
  * @param {number} ms
