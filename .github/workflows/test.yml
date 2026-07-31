@@ -19,13 +19,18 @@ jobs:
       # 지원 하한(20)과 현행(22)을 둘 다 돌린다. package.json의 engines가
       # ">=20"이라고 선언한 이상, 20에서 도는지는 실제로 확인돼야 하는 사실이다.
       #
-      # Windows를 함께 도는 이유 (실측 2026-07-31): 이 도구의 주 사용자 환경이
-      # Windows다(run.bat·콘솔 코드페이지·경로 제약). 그리고 update-check.js가
-      # Windows에서만 100% 크래시하는 결함이 실제로 나왔는데, ubuntu만 도는 CI는
-      # 그걸 그대로 통과시켰다. 사용자가 발견하기 전에 CI가 발견해야 한다.
+      # 세 OS를 다 도는 이유 (실측 2026-07-31): update-check.js가 Windows에서만 100%
+      # 크래시하는 결함이 실제로 나왔는데, ubuntu만 도는 CI는 그걸 그대로 통과시켰다.
+      # 사용자가 발견하기 전에 CI가 발견해야 한다.
+      #
+      # 그래서 규칙을 세운다 — **지원한다고 적은 플랫폼은 매트릭스에 넣는다.**
+      #   ubuntu  : 개발·검증의 기준선
+      #   windows : 주 사용자 환경 (run.bat·콘솔 코드페이지·경로 제약)
+      #   macos   : run.sh로 지원한다고 README에 적어 두고 실기 검증이 한 번도 없었다
+      # 6조합이지만 실행은 조합당 수십 초다. 검증되지 않은 "지원"이 문서에 남는 비용이 더 크다.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [20, 22]
 
     steps:
