@@ -563,12 +563,15 @@ GitHub Actions 워크플로 두 개가 돈다.
 
 | 워크플로 | 시점 | 하는 일 |
 |---|---|---|
-| `test.yml` | PR, main push | Node 20·22에서 `node --test` + `scripts/check-leak.js` |
+| `test.yml` | PR, main push | Linux·Windows·macOS × Node 20·22에서 `node --test` + `scripts/check-leak.js` |
 | `version-bump.yml` | main push | `package.json`의 patch를 1 올려 커밋 |
 
 `test.yml`이 Node 20과 22를 둘 다 도는 이유는 `engines`가 `>=20`이라고 선언한 이상 하한이
-실제로 도는지가 확인돼야 할 사실이기 때문이다. 의존성 설치 단계는 없다 — 런타임 의존성 0이
-설계 전제라서 받을 것이 없고, 설치 단계가 있으면 언젠가 의존성이 슬쩍 들어와도 눈치채지 못한다.
+실제로 도는지가 확인돼야 할 사실이기 때문이다. 같은 이유로 **지원한다고 적은 플랫폼은
+전부 매트릭스에 넣는다** — Windows에서만 터지는 결함이 Linux 전용 CI를 그대로 통과한
+전례가 있다(2026-07-31). 검증되지 않은 "지원"이 문서에 남아 있는 것이 6조합을 도는 비용보다
+비싸다. 의존성 설치 단계는 없다 — 런타임 의존성 0이 설계 전제라서 받을 것이 없고, 설치
+단계가 있으면 언젠가 의존성이 슬쩍 들어와도 눈치채지 못한다.
 
 `version-bump.yml`이 버전을 자동으로 올리는 이유는 `version`이 산출물 frontmatter의
 `scout_version`으로 각인되기 때문이다. 그 값이 "이 보고서를 어느 코드로 뽑았나"의 유일한
