@@ -229,6 +229,100 @@ export function bar(done, total, width = 10) {
 }
 
 /**
+ * 배너·단계 줄에 쓰면 안 되는 문자.
+ *
+ * 둥근 모서리와 이중선은 cp949에 매핑이 없어 Windows 콘솔에서 깨질 수 있다.
+ * 반면 단선 박스 드로잉(`┌ ┐ └ ┘ ├ ┤ ┼ ─ │`)과 `▶`는 이 앱이 이미 출력하는 문자라
+ * 실환경에서 검증됐다. `.bat`을 ASCII로 제한한 것과 같은 판단 — 깨진 장식은 장식이 아니다.
+ */
+const FORBIDDEN_BOX = ['╭', '╮', '╰', '╯', '═', '║'];
+
+/** 배너 최대 폭. 요약표·계획표의 구분선(60)과 맞춘다. */
+export const BANNER_WIDTH = 60;
+
+/**
+ * 시작 배너 아트. **화면 전용이다** — 로그 파일에는 텍스트 한 줄만 남는다
+ * (아트가 섞이면 사후 파싱·대조가 지저분해진다).
+ *
+ * 조준경 안에 재생 버튼이 들어온 형태다. 정찰병("목표를 정해 관찰한다") 은유이고,
+ * 십자선이 밖으로 뻗은 모양이 구간을 잘라 들여다보는 청크 구조와도 겹친다.
+ *
+ * @param {string} version
+ * @returns {string[]} 줄 배열 (호출자가 빈 줄로 감싼다)
+ */
+export function bannerArt(version) {
+  const lines = [
+    '              │',
+    '         ┌────┼────┐',
+    '       ──┤    ▶    ├──',
+    '         └────┼────┘',
+    '              │',
+    `       YouTube Scout v${version}`,
+  ];
+
+  // 안전망. 나중에 누가 둥근 모서리로 "예쁘게" 고치면 여기서 즉시 터진다
+  // (조용히 깨진 배너보다 낫다 — run.bat의 ASCII 검사와 같은 장치다).
+  for (const line of lines) {
+    const bad = FORBIDDEN_BOX.find((ch) => line.includes(ch));
+    if (bad) throw new Error(`배너에 쓸 수 없는 문자가 있다: ${JSON.stringify(bad)}`);
+    if (displayWidth(line) > BANNER_WIDTH) {
+      throw new Error(`배너 줄이 ${BANNER_WIDTH}칸을 넘는다: ${JSON.stringify(line)}`);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * 부팅 단계 한 줄의 모양. 로그 줄(`[HH:MM:SS] ...`)과 구분되게 들여쓰고 점을 붙인다.
+ * @param {string} text
+ */
+export function formatBootStep(text) {
+  return `  · ${text}`;
+}
+
+/**
+ * 부팅 단계 표시.
+ *
+ * ## 왜 덮어쓰기(진행바)를 버렸는가 (실사용 관찰 2026-07-31)
+ * 덮어쓰는 진행바는 **하나의 긴 대기**에 맞는 장치인데 부팅은 짧은 단계의 연속이다.
+ * 궁합이 맞지 않아 실제로는 이렇게 됐다: 깜빡임을 막으려 등장을 지연시켰더니
+ * 1편짜리 실행(부팅 약 1초)에서는 아예 나타나지 않았고, "실행하면 뭔가 도는 게
+ * 보였으면 좋겠다"는 원래 요청을 정확히 되돌려 놓았다.
+ *
+ * 누적 줄은 그 문제가 없다. **화면이 채워지는 것 자체가 진행 표시**이고, 실행이 빨라도
+ * 흔적이 남는다. 지운 것을 되살릴 방법이 없는 덮어쓰기와 달리, 지나간 단계를 눈으로
+ * 되짚을 수도 있다.
+ *
+ * ## 끝난 단계만 낸다
+ * 시작을 알리는 API를 두지 않았다 — 있으면 언젠가 "곧 끝날 것"을 미리 출력하게 된다.
+ * 예상을 그럴듯하게 채우지 않는다는 원칙(이 파일 머리말)을 구조로 못 박은 것이다.
+ *
+ * @param {{ out?: (line: string) => void, enabled?: boolean }} [opts]
+ *   `enabled`가 false면 한 줄도 내지 않는다 (파이프·리다이렉트에는 표시를 보내지 않는다).
+ */
+export function createBootSteps(opts = {}) {
+  const { out = () => {}, enabled = true } = opts;
+  /** @type {string[]} */
+  const done = [];
+
+  return {
+    /**
+     * 끝난 단계 하나를 남긴다.
+     * @param {string} text
+     */
+    finish(text) {
+      done.push(text);
+      if (enabled) out(formatBootStep(text));
+    },
+    /** 지금까지 끝난 단계들 (테스트·디버깅용) */
+    get steps() {
+      return [...done];
+    },
+  };
+}
+
+/**
  * 경과·잔여 시간 표기. 초 미만은 버린다 (밀리초는 사람이 읽을 정보가 아니다).
  *
  * @param {number} ms

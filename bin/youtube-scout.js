@@ -62,7 +62,7 @@ import {
   UPDATE_CHECK_NAME,
 } from '../src/init.js';
 import { fetchLatestCommitMs, needsRefresh } from './update-check.js';
-import { spinner, bar, fmtSec } from './ui.js';
+import { spinner, bar, fmtSec, bannerArt, createBootSteps } from './ui.js';
 import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
 
@@ -220,61 +220,16 @@ async function waitVisible(ms, label) {
 }
 
 /**
- * 부팅 진행바가 등장하기까지의 대기. 이 시간 안에 부팅이 끝나면 화면에 아예 나타나지 않는다.
- * 800ms인 이유: 사람이 "멈췄나?"라고 느끼기 시작하는 지점보다 앞이면서, 1편짜리 실행
- * (실측 약 1초)이 대체로 이 안에 끝나 깜빡임을 만들지 않는 값이다.
+ * 부팅 단계 표시를 만든다. 판정·형식은 코어(ui.js)가 하고 여기서는 출력 대상만 정한다.
+ *
+ * **화면 전용이다.** `show()`로 내고 `_batch.log`에는 남기지 않는다 — 부팅 단계는
+ * 사건이 아니라 표시이기 때문이다 (대기 카운트다운을 로그에 남기지 않는 것과 같은 판단).
+ *
+ * 파이프·리다이렉트에는 내지 않는다. 이 줄들은 사람이 화면에서 "돌고 있다"를 읽기 위한
+ * 것이고, 기계가 받는 출력은 종전 그대로여야 한다.
  */
-const BOOT_BAR_DELAY_MS = 800;
-
-/**
- * 부팅 단계 진행바.
- *
- * 부팅은 상태 파일 읽기 → 모델 목록 조회 → 대조 → 메타 조회로 이어지는데, 네트워크 구간이
- * 두 개라 아무 표시 없이 수십 초가 지나간다. 그 침묵이 "죽었다"로 읽힌다(청크 스피너를 넣은
- * 것과 같은 이유).
- *
- * **채우는 것은 실제로 끝난 단계뿐이다.** 예상 소요를 보간해 바를 미리 채우지 않는다 —
- * 하네스가 모델에게 "반쯤 읽힌 것을 온전하게 채우지 마라"고 요구하면서 UI가 그걸 하면 안 된다
- * (ui.js의 설계 원칙과 동일). 메타 조회 구간만 실제 n/m 카운트를 소수로 반영한다.
- *
- * TTY가 아니면 spinner가 통째로 무동작이라 출력은 배너 한 줄 외에 종전과 같다.
- *
- * @param {number} total 단계 수
- */
-function bootProgress(total) {
-  let done = 0;
-  let label = '준비 중';
-  // 지연 등장. 영상 1편이면 부팅 전체가 1초 남짓이라, 바로 그리면 프레임 몇 개가
-  // 깜빡였다 사라지고 그 사이 로그 줄이 나갈 때마다 지워진다 — 정보가 아니라 산만함이다.
-  // 배치가 커서 메타 조회가 길어질 때(원래 이 표시가 겨냥한 상황)만 나타난다.
-  const sp = spinner(() => `${bar(done, total)} ${label}`, { delayMs: BOOT_BAR_DELAY_MS });
-  activeSpinner = sp.active ? sp : null;
-
-  return {
-    /**
-     * 끝난 단계를 채운다.
-     * @param {string} text
-     * @param {number} [at] 채울 위치. 생략하면 한 칸 전진 (소수로 채우던 단계 뒤에는 명시할 것)
-     */
-    step(text, at = done + 1) {
-      done = Math.min(total, at);
-      label = text;
-    },
-    /**
-     * 진행 중 표시만 갱신한다 (아직 끝나지 않은 단계).
-     * @param {string} text
-     * @param {number} [at] 한 단계 안의 실제 n/m을 소수로 반영할 때만 준다
-     */
-    tick(text, at) {
-      label = text;
-      if (Number.isFinite(at)) done = Math.min(total, Number(at));
-    },
-    /** 줄을 비우고 화면을 기존 출력에 넘긴다 */
-    end() {
-      sp.done('');
-      if (activeSpinner === sp) activeSpinner = null;
-    },
-  };
+function makeBootSteps() {
+  return createBootSteps({ out: show, enabled: Boolean(process.stdout.isTTY) });
 }
 
 /**
@@ -883,9 +838,12 @@ async function main() {
   //   (실사용 관찰 2026-07-31: 사용자가 "배너가 없다"고 보고했다).
   // 파일: 타임스탬프를 붙여 남긴다. "이 보고서를 어느 버전으로 뽑았나"가 사후 추적의
   //   근거라, 로그에는 다른 줄과 같은 형식으로 있어야 시각을 대조할 수 있다.
+  // 아트는 TTY에서만. 파이프·리다이렉트로 나가는 출력에 장식이 섞이면 기계로 읽는 쪽이
+  // 깨진다 (스피너를 TTY로 제한한 것과 같은 규칙). 비TTY는 종전대로 텍스트 한 줄이다.
   const banner = `youtube-scout v${scoutVersion}`;
   show('');
-  show(banner);
+  if (process.stdout.isTTY) for (const line of bannerArt(scoutVersion)) show(line);
+  else show(banner);
   show('');
   logFile(stamp(banner));
 
@@ -898,8 +856,8 @@ async function main() {
 
   const requestedModels = String(values.models).split(',');
 
-  // 부팅 5단계: 상태 파일 읽기 → 목록 조회 → 대조 → 메타 조회 → 준비 완료
-  const boot = bootProgress(5);
+  // 부팅 단계 표시. 끝난 단계가 한 줄씩 쌓인다.
+  const boot = makeBootSteps();
 
   // 3-4) 모델 상태 파일 로딩. 지난 실행들이 남긴 실패 관찰을 이어받는다.
   //      없는 파일은 빈 상태다 — 첫 실패가 생길 때 도구가 만든다(init은 만들지 않는다).
@@ -924,14 +882,14 @@ async function main() {
     // 파일에도 반영한다. 화면과 파일이 다르면 사용자가 어느 쪽을 믿을지 알 수 없다.
     await writeStatusFile();
   }
-  boot.step('상태 파일 읽기');
+  boot.finish('상태 파일 읽기');
 
   // 3-5) 부팅 대조 1회. `/v1beta/models`는 generateContent 쿼터를 쓰지 않으므로
   //      본 작업의 예산을 깎지 않는다. 조회가 실패하면 조용히 생략한다 —
   //      대조는 보조 기능이고, 이것 때문에 추출이 막히면 우선순위가 뒤집힌다.
-  boot.tick('모델 목록 조회');
   const available = await fetchAvailableModels(apiKey);
-  boot.step('모델 목록 조회');
+  // 조회 실패도 끝난 단계다. 몇 종을 봤는지(또는 못 봤는지)가 뒤의 대조 결과를 설명한다.
+  boot.finish(`모델 목록 조회 (${available ? `${available.length}종` : '건너뜀'})`);
   const reconciled = reconcilePool(requestedModels, available);
   for (const line of reconcileMessages(reconciled)) log(line);
 
@@ -947,12 +905,11 @@ async function main() {
   const reconcileLabel = [`${applied.pool.length}종`];
   if (demotedModels.size) reconcileLabel.push(`강등 ${demotedModels.size}`);
   if (blockedModels.size) reconcileLabel.push(`차단 ${blockedModels.size}`);
-  boot.step(`모델 대조 (${reconcileLabel.join(', ')})`);
+  boot.finish(`모델 대조 (${reconcileLabel.join(', ')})`);
 
   for (const line of statusMessages(applied)) log(line);
 
   if (!applied.pool.length && applied.blocked.length) {
-    boot.end();
     // 전부 차단된 상태로 실행하면 "모델 목록이 유효하지 않다"는 엉뚱한 안내가 나간다.
     // 원인이 상태 파일이라는 것과 복권 방법을 바로 알려 준다.
     show('');
@@ -969,7 +926,6 @@ async function main() {
   try {
     pool = new ModelPool(applied.pool);
   } catch {
-    boot.end();
     show(`--models 값이 유효하지 않다: ${values.models}`);
     return 2;
   }
@@ -979,8 +935,6 @@ async function main() {
   log(`메타 조회 (${ids.length}편)`);
   const metas = [];
   for (const id of ids) {
-    // 진행 중 표시는 세어서 아는 값이다(보간 없음). 바는 이 단계 한 칸을 n/m으로 나눠 채운다.
-    boot.tick(`메타 조회 ${metas.length}/${ids.length}`, 3 + metas.length / ids.length);
     const m = await fetchMeta(watchUrl(id));
     metas.push(m);
     if (m.playable) {
@@ -991,19 +945,16 @@ async function main() {
     }
   }
 
-  // 소수로 채우던 단계라 다음 칸을 명시한다 (기본값 done+1이면 소수가 그대로 이어진다).
-  boot.step(`메타 조회 ${ids.length}/${ids.length}`, 4);
+  // 진행 중에는 영상별 ✓/✗ 줄이 이미 나가므로 여기서는 최종 카운트 한 줄만 낸다
+  // (같은 정보를 두 곳에서 세면 어느 쪽이 진짜인지 읽는 사람이 판단해야 한다).
+  boot.finish(`메타 조회 ${metas.length}/${ids.length}`);
 
   const playable = metas.filter((m) => m.playable);
   if (!playable.length) {
-    boot.end();
     show('');
     log('처리 가능한 영상이 없다. API를 한 번도 호출하지 않았다.');
     return 1;
   }
-
-  boot.step('준비 완료');
-  boot.end();
 
   // 병렬로 돌던 확인의 결과를 여기서 받는다. 부팅이 이미 네트워크를 두 번 쳤으므로
   // 대부분 이미 끝나 있고, 늦어도 3초에서 끊긴다.

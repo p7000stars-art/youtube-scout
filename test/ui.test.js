@@ -2,7 +2,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { bar, fmtSec, spinner, displayWidth, FRAMES, FRAME_MS } from '../bin/ui.js';
+import {
+  bar,
+  fmtSec,
+  spinner,
+  displayWidth,
+  bannerArt,
+  createBootSteps,
+  formatBootStep,
+  BANNER_WIDTH,
+  FRAMES,
+  FRAME_MS,
+} from '../bin/ui.js';
 
 // 스피너 자체는 타이밍·TTY 의존이라 단위 테스트에서 다루지 않는다 (실제 검증은 로컬 육안).
 // 여기서는 순수 함수와, TTY가 아닐 때 아무것도 쓰지 않는다는 계약만 고정한다.
@@ -217,4 +228,95 @@ test('非TTY 스트림이면 delayMs와 무관하게 아무것도 쓰지 않는�
   assert.equal(sp.active, false);
   sp.done('');
   assert.deepEqual(writes, []);
+});
+
+// ── 시작 배너 아트 ──────────────────────────────────────────────────
+
+test('배너에 버전이 들어간다', () => {
+  assert.ok(bannerArt('0.2.2').join('\n').includes('YouTube Scout v0.2.2'));
+  assert.ok(bannerArt('9.9.9').join('\n').includes('YouTube Scout v9.9.9'));
+});
+
+test('배너에 금지 문자가 하나도 없다 (cp949 매핑이 없어 깨진다)', () => {
+  // 둥근 모서리·이중선은 Windows 콘솔에서 깨질 수 있다. 깨진 장식은 장식이 아니다.
+  const text = bannerArt('0.2.2').join('');
+  for (const ch of ['╭', '╮', '╰', '╯', '═', '║']) {
+    assert.ok(!text.includes(ch), `${ch} 가 없어야 한다`);
+  }
+});
+
+test('배너는 단선 박스 드로잉과 ▶ 만 쓴다 (이미 검증된 문자들)', () => {
+  const allowed = new Set([...' │┌┐└┘├┤┼─▶']);
+  for (const ch of bannerArt('0.2.2').join('')) {
+    const ok = allowed.has(ch) || (ch.codePointAt(0) ?? 0) <= 0x7f;
+    assert.ok(ok, `허용되지 않은 문자: ${JSON.stringify(ch)}`);
+  }
+});
+
+test('배너 각 줄은 60칸을 넘지 않는다 (구분선 폭과 맞춤)', () => {
+  for (const line of bannerArt('0.2.2')) {
+    assert.ok(displayWidth(line) <= BANNER_WIDTH, `${JSON.stringify(line)} 폭 초과`);
+  }
+});
+
+test('배너는 조준경 형태를 유지한다 (십자선 + 재생 버튼)', () => {
+  const lines = bannerArt('0.2.2');
+  assert.equal(lines.length, 6);
+  assert.ok(lines.some((l) => l.includes('▶')), '재생 버튼');
+  assert.ok(lines.some((l) => l.includes('┼')), '십자선 교차점');
+});
+
+// ── 부팅 단계 줄 ────────────────────────────────────────────────────
+
+test('끝난 단계만 출력된다 (생성 시점에는 아무것도 없다)', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l) });
+
+  assert.deepEqual(out, [], '만들기만 해서는 한 줄도 나오지 않는다');
+  assert.deepEqual(boot.steps, []);
+
+  boot.finish('상태 파일 읽기');
+  assert.deepEqual(out, [formatBootStep('상태 파일 읽기')]);
+
+  boot.finish('모델 목록 조회 (15종)');
+  assert.deepEqual(out, [
+    formatBootStep('상태 파일 읽기'),
+    formatBootStep('모델 목록 조회 (15종)'),
+  ]);
+});
+
+test('단계 줄은 로그 줄과 구분되는 모양이다', () => {
+  const line = formatBootStep('메타 조회 1/1');
+  assert.match(line, /^ {2}· /);
+  assert.ok(line.includes('메타 조회 1/1'));
+  // 타임스탬프를 붙이지 않는다 — 사건이 아니라 표시다
+  assert.doesNotMatch(line, /^\[\d{2}:\d{2}:\d{2}\]/);
+});
+
+test('enabled=false면 한 줄도 내지 않는다 (파이프·리다이렉트)', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l), enabled: false });
+
+  boot.finish('상태 파일 읽기');
+  boot.finish('모델 대조 (10종, 강등 5)');
+
+  assert.deepEqual(out, [], '출력 없음');
+  assert.deepEqual(boot.steps, ['상태 파일 읽기', '모델 대조 (10종, 강등 5)'], '기록은 남는다');
+});
+
+test('단계 줄에 제어문자가 섞이지 않는다 (덮어쓰기를 버린 이유)', () => {
+  /** @type {string[]} */
+  const out = [];
+  const boot = createBootSteps({ out: (l) => out.push(l) });
+  boot.finish('상태 파일 읽기');
+  assert.ok(!out.join('').includes('\r'), '커서 제어 없음');
+  assert.ok(!out.join('').includes('\n'), '개행은 호출자가 붙인다');
+});
+
+test('out을 주지 않아도 던지지 않는다', () => {
+  const boot = createBootSteps();
+  boot.finish('상태 파일 읽기');
+  assert.deepEqual(boot.steps, ['상태 파일 읽기']);
 });
