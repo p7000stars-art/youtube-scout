@@ -4,13 +4,19 @@ import assert from 'node:assert/strict';
 
 import { runChunk } from '../bin/chunk-runner.js';
 import { ExtractError } from '../src/extract.js';
-import { ModelPool, MAX_RETRIES } from '../src/quota.js';
+import { ModelPool } from '../src/quota.js';
 
 /**
  * TPM 경로가 한 모델에 주는 시도 횟수 (초기 1회 + 재시도 1회).
  * chunk-runner의 TPM_MAX_ATTEMPTS와 짝이다 — 그쪽을 바꾸면 이 값도 바꿔야 한다.
  */
 const TPM_ATTEMPTS = 2;
+
+/**
+ * 5xx 경로가 한 모델에 주는 시도 횟수 (초기 1회 + 재시도 1회).
+ * chunk-runner의 SERVER_MAX_ATTEMPTS와 짝이다.
+ */
+const SERVER_ATTEMPTS = 2;
 
 // 이 루프의 결함은 실패가 순서대로 겹칠 때만 드러난다. 실 API로는 재현할 방법이 없으므로
 // 모델별 응답 시퀀스를 주입해 고정한다. 대기는 no-op으로 바꿔 실시간을 쓰지 않는다.
@@ -224,14 +230,66 @@ test('구조적 TPM 판정은 모델마다 새로 한다 (교체된 모델도 �
   assert.equal(waits, 2);
 });
 
-test('5xx는 여전히 3회까지 재시도한다 (서버 혼잡은 시간이 해결해 준다)', async () => {
-  // TPM 예산만 줄였다. 성질이 다른 경로를 함께 줄이면 일시적 혼잡에서 멀쩡한 모델을 버린다.
-  const { promise, mock } = run(['A', 'B'], { A: ['500', '500', '500', 'ok'] });
+test('5xx는 한 번만 기다리고 그래도 5xx면 모델을 교체한다', async () => {
+  // 실측 2026-07-31: gemini-3.5-flash가 10·20·30초 대기를 전부 지키고도 계속 503이었고
+  // 가용 모델 10종을 안 써 본 채 6분 39초를 태우고 0/2로 끝났다. 대기가 아니라 교체가 답이다.
+  const { promise, mock, pool } = run(['A', 'B'], { A: ['500'], B: ['ok'] });
   const res = await promise;
+
   assert.equal(res.ok, true);
-  assert.equal(res.model, 'A');
-  assert.equal(mock.countFor('A'), MAX_RETRIES + 1, '초기 1회 + 재시도 3회');
+  assert.equal(res.model, 'B', '교체됐다');
+  assert.equal(mock.countFor('A'), SERVER_ATTEMPTS, 'A는 초기 1회 + 재시도 1회까지만');
+  assert.ok(pool.overloaded.has('A'), '이번 실행에서 제외됐다');
+});
+
+test('한 번 기다린 뒤 성공하면 교체하지 않는다 (진짜 일시 혼잡)', async () => {
+  const { promise, mock, pool } = run(['A', 'B'], { A: ['500', 'ok'] });
+  const res = await promise;
+
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'A', '한 번은 봐준다');
+  assert.equal(mock.countFor('A'), 2);
   assert.equal(mock.countFor('B'), 0);
+  assert.equal(pool.overloaded.size, 0, '제외하지 않는다');
+});
+
+test('전 모델이 5xx면 그때 비로소 청크가 실패한다', async () => {
+  const { promise, pool } = run(['A', 'B'], { A: ['500'], B: ['500'] });
+  const res = await promise;
+
+  assert.equal(res.ok, false);
+  if (res.ok === false) {
+    assert.equal(res.poolEmpty, true);
+    assert.match(res.reason, /서버 과부하/);
+  }
+  assert.deepEqual([...pool.overloaded].sort(), ['A', 'B']);
+});
+
+test('503은 상태 파일에 기록하지 않는다 (모델의 속성이 아니라 그 순간 서버 사정)', async () => {
+  // 기록하면 멀쩡한 모델이 다음 실행에서 강등된 채로 시작한다.
+  /** @type {string[]} */
+  const recorded = [];
+  const { promise } = run(
+    ['A', 'B'],
+    { A: ['500'], B: ['ok'] },
+    { onFailure: (/** @type {string} */ m, /** @type {string} */ kind) => { recorded.push(`${m}:${kind}`); } },
+  );
+  await promise;
+
+  assert.deepEqual(recorded, [], 'onFailure가 한 번도 불리지 않는다');
+});
+
+test('404·rpd·tpm은 여전히 기록된다 (503만 예외라는 것)', async () => {
+  /** @type {string[]} */
+  const recorded = [];
+  const { promise } = run(
+    ['A', 'B', 'C', 'D'],
+    { A: ['404'], B: ['rpd'], C: ['tpm', 'tpm'], D: ['ok'] },
+    { onFailure: (/** @type {string} */ m, /** @type {string} */ kind) => { recorded.push(`${m}:${kind}`); } },
+  );
+  await promise;
+
+  assert.deepEqual(recorded, ['A:404', 'B:rpd', 'C:tpm']);
 });
 
 // ── 무한 순환 방지 ──────────────────────────────────────────────────
@@ -302,13 +360,13 @@ test('403은 재시도·교체 없이 즉시 실패한다 (재생 불가 신호�
   assert.equal(mock.calls.length, 1, '다른 모델을 시도하지 않는다');
 });
 
-test('5xx는 같은 모델로 재시도한다', async () => {
-  const { promise, mock } = run(['A', 'B'], { A: ['500', '500', 'ok'] });
+test('5xx도 교체 후에는 새 모델이 자기 예산을 온전히 받는다', async () => {
+  // 교체가 카운터를 리셋하지 않으면 B가 첫 500에서 바로 버려진다.
+  const { promise, mock } = run(['A', 'B'], { A: ['500'], B: ['500', 'ok'] });
   const res = await promise;
   assert.equal(res.ok, true);
-  assert.equal(res.model, 'A', '5xx는 모델을 바꾸지 않는다');
-  assert.equal(mock.countFor('A'), 3);
-  assert.equal(mock.countFor('B'), 0);
+  assert.equal(res.model, 'B');
+  assert.equal(mock.countFor('B'), SERVER_ATTEMPTS, 'B도 초기 1회 + 재시도 1회를 받는다');
 });
 
 test('ExtractError가 아닌 예외는 그대로 실패로 보고한다', async () => {
@@ -349,13 +407,31 @@ test('교체가 없으면 onModelChange가 불리지 않는다', async () => {
 // ── 대기 라벨 (수정 5의 입력) ───────────────────────────────────────
 
 test('TPM 대기와 5xx 대기는 서로 다른 라벨로 알린다', async () => {
-  /** @type {string[]} */
-  const labels = [];
-  const { promise } = run(
-    ['A'],
-    { A: ['tpm', '500', 'ok'] },
-    { wait: async (/** @type {number} */ _ms, /** @type {string} */ label) => { labels.push(label); } },
-  );
-  await promise;
-  assert.deepEqual(labels, ['TPM 회복 대기 중...', '서버 혼잡 대기 중...']);
+  // 두 경로를 한 실행에 섞지 않는다. attempt는 "현재 모델에서의 시도 횟수"라
+  // 경로를 넘나들며 공유되므로(모델이 두 번 실패하면 교체), 라벨 검증은 따로 한다.
+  /** @param {Record<string, string[]>} behavior */
+  const labelsOf = async (behavior) => {
+    /** @type {string[]} */
+    const labels = [];
+    const { promise } = run(
+      ['A'],
+      behavior,
+      { wait: async (/** @type {number} */ _ms, /** @type {string} */ label) => { labels.push(label); } },
+    );
+    await promise;
+    return labels;
+  };
+
+  assert.deepEqual(await labelsOf({ A: ['tpm', 'ok'] }), ['TPM 회복 대기 중...']);
+  assert.deepEqual(await labelsOf({ A: ['500', 'ok'] }), ['서버 혼잡 대기 중...']);
+});
+
+test('한 모델에서 서로 다른 실패가 겹치면 두 번째에 교체한다', async () => {
+  // attempt는 "현재 모델에서의 시도 횟수"다. tpm 한 번 + 500 한 번이면 그 모델은
+  // 이미 두 번 실패한 것이므로, 종류가 달라도 더 붙잡고 있을 이유가 없다.
+  const { promise, mock } = run(['A', 'B'], { A: ['tpm', '500'], B: ['ok'] });
+  const res = await promise;
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'B');
+  assert.equal(mock.countFor('A'), 2);
 });
