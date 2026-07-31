@@ -62,7 +62,16 @@ import {
   UPDATE_CHECK_NAME,
 } from '../src/init.js';
 import { fetchLatestCommitMs, needsRefresh } from './update-check.js';
-import { spinner, bar, fmtSec, bannerArt, createBootSteps } from './ui.js';
+import {
+  spinner,
+  bar,
+  fmtSec,
+  bannerArt,
+  createBootSteps,
+  createColors,
+  colorEnabled,
+  paintNotice,
+} from './ui.js';
 import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
 
@@ -144,6 +153,17 @@ let logPath = null;
  */
 let activeSpinner = null;
 
+/**
+ * 색상 묶음. 한 번만 판정해 전역으로 쓴다 — 판정이 흩어지면 언젠가 한 곳이 빠지고,
+ * 그 한 곳이 파이프 출력에 이스케이프를 흘린다.
+ *
+ * TTY가 아니거나 NO_COLOR·FORCE_COLOR=0 이면 전부 항등 함수가 되므로 호출부에 조건문이 없다.
+ */
+const colors = createColors(colorEnabled());
+
+/** 부팅 단계 수: 상태 파일 읽기 → 목록 조회 → 대조 → 메타 조회 → 준비 완료 */
+const BOOT_STEPS = 5;
+
 /** @param {string} msg */
 function stamp(msg) {
   const d = new Date();
@@ -174,14 +194,16 @@ function flushLog() {
 function log(msg) {
   const line = stamp(msg);
   activeSpinner?.clear();
-  console.log(line);
+  // 색은 화면에만. 파일에 이스케이프가 들어가면 사후 파싱이 깨지고, 무엇보다
+  // 로그를 근거로 쓰는 사람이 원문을 못 읽게 된다.
+  console.log(paintNotice(line, colors));
   logFile(line);
 }
 
 /** 사용자에게 보여주되 로그 파일에는 남기지 않는 순수 표시용 출력 */
 function show(msg = '') {
   activeSpinner?.clear();
-  console.log(msg);
+  console.log(paintNotice(msg, colors));
 }
 
 /**
@@ -229,7 +251,12 @@ async function waitVisible(ms, label) {
  * 것이고, 기계가 받는 출력은 종전 그대로여야 한다.
  */
 function makeBootSteps() {
-  return createBootSteps({ out: show, enabled: Boolean(process.stdout.isTTY) });
+  return createBootSteps({
+    out: show,
+    enabled: Boolean(process.stdout.isTTY),
+    total: BOOT_STEPS,
+    colors,
+  });
 }
 
 /**
@@ -610,7 +637,9 @@ async function runVideo(p) {
 
     const t0 = Date.now();
     const sp = spinner(
-      (frame) => `${prefix}${body(shownModel)} ${frame} ${fmtSec(Date.now() - t0)}`,
+      // 경과 시간만 색을 준다 — 침묵이 길어질 때 눈이 가야 할 곳이 거기다.
+      // 프레임 문자는 기본색으로 둔다(움직임 자체가 이미 신호다).
+      (frame) => `${prefix}${body(shownModel)} ${frame} ${colors.yellow(fmtSec(Date.now() - t0))}`,
     );
     activeSpinner = sp.active ? sp : null;
     if (!sp.active) console.log(startLine);
@@ -842,7 +871,7 @@ async function main() {
   // 깨진다 (스피너를 TTY로 제한한 것과 같은 규칙). 비TTY는 종전대로 텍스트 한 줄이다.
   const banner = `youtube-scout v${scoutVersion}`;
   show('');
-  if (process.stdout.isTTY) for (const line of bannerArt(scoutVersion)) show(line);
+  if (process.stdout.isTTY) for (const line of bannerArt(scoutVersion)) show(colors.cyan(line));
   else show(banner);
   show('');
   logFile(stamp(banner));
@@ -963,6 +992,8 @@ async function main() {
     log(`  (직접 실행 중이라면: youtube-scout init 으로 만든 폴더의 ${UPDATE_CHECK_NAME} 가 이 일을 한다)`);
   }
 
+  boot.finish('준비 완료');
+
   // 5) 계획표 + 예상 요청 수. 청크 분할이 요청 수를 곱한다는 사실을 투입 전에 보여준다.
   //
   // 한도 추정은 **실패 이력이 없는 모델 수**로 낸다. 풀 크기로 세면 강등·차단된 모델까지
@@ -1061,8 +1092,14 @@ async function main() {
   show('요약');
   show('─'.repeat(60));
   for (const s of summary) {
-    const mark = s.done === s.total ? '✓' : '⛔';
-    show(`  ${mark} ${String(s.done).padStart(3)}/${String(s.total).padEnd(3)} ${s.note.padEnd(12)} ${s.title || s.id}`);
+    const ok = s.done === s.total;
+    // 기호는 그대로 두고 색만 입힌다 — 색을 꺼도 ✓/⛔로 읽을 수 있어야 한다.
+    const mark = ok ? colors.green('✓') : colors.red('⛔');
+    // padEnd는 색을 입히기 **전에** 한다. 이스케이프는 폭이 0인데 length에는 잡혀
+    // 색을 먼저 입히면 표 정렬이 무너진다.
+    const note = s.note.padEnd(12);
+    const painted = s.note.startsWith('실패') ? colors.red(note) : note;
+    show(`  ${mark} ${String(s.done).padStart(3)}/${String(s.total).padEnd(3)} ${painted} ${s.title || s.id}`);
   }
   show('─'.repeat(60));
   if (pool.exhausted.size) {
