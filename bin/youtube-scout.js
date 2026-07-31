@@ -8,7 +8,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { readFile, writeFile, mkdir, appendFile, access, readdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, access, readdir, stat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -63,6 +63,7 @@ import {
 } from '../src/init.js';
 import { fetchLatestCommitMs, needsRefresh } from './update-check.js';
 import { spinner, bar, fmtSec } from './ui.js';
+import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -150,9 +151,23 @@ function stamp(msg) {
   return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}] ${msg}`;
 }
 
+/**
+ * 로그 쓰기는 큐를 거친다 — 순서 보장의 근거는 log-queue.js 주석에 있다.
+ * 호출자는 기다리지 않는다(순서만 보장하고 즉시 반환한다).
+ */
+const logWriter = createLogWriter();
+
 /** 파일에만 남긴다. 화면 출력은 호출자가 따로 정한다 (스피너가 줄을 점유하는 경우). */
 function logFile(line) {
-  if (logPath) appendFile(logPath, `${line}\n`, 'utf8').catch(() => {});
+  logWriter.write(line);
+}
+
+/**
+ * 큐에 남은 쓰기를 끝까지 기다린다. **정상 종료 직전에 한 번 부른다.**
+ * 프로세스가 큐를 남긴 채 끝나면 마지막 줄들이 유실되고, 화면의 요약과 파일이 어긋난다.
+ */
+function flushLog() {
+  return logWriter.flush();
 }
 
 /** @param {string} msg */
@@ -205,6 +220,13 @@ async function waitVisible(ms, label) {
 }
 
 /**
+ * 부팅 진행바가 등장하기까지의 대기. 이 시간 안에 부팅이 끝나면 화면에 아예 나타나지 않는다.
+ * 800ms인 이유: 사람이 "멈췄나?"라고 느끼기 시작하는 지점보다 앞이면서, 1편짜리 실행
+ * (실측 약 1초)이 대체로 이 안에 끝나 깜빡임을 만들지 않는 값이다.
+ */
+const BOOT_BAR_DELAY_MS = 800;
+
+/**
  * 부팅 단계 진행바.
  *
  * 부팅은 상태 파일 읽기 → 모델 목록 조회 → 대조 → 메타 조회로 이어지는데, 네트워크 구간이
@@ -222,7 +244,10 @@ async function waitVisible(ms, label) {
 function bootProgress(total) {
   let done = 0;
   let label = '준비 중';
-  const sp = spinner(() => `${bar(done, total)} ${label}`);
+  // 지연 등장. 영상 1편이면 부팅 전체가 1초 남짓이라, 바로 그리면 프레임 몇 개가
+  // 깜빡였다 사라지고 그 사이 로그 줄이 나갈 때마다 지워진다 — 정보가 아니라 산만함이다.
+  // 배치가 커서 메타 조회가 길어질 때(원래 이 표시가 겨냥한 상황)만 나타난다.
+  const sp = spinner(() => `${bar(done, total)} ${label}`, { delayMs: BOOT_BAR_DELAY_MS });
   activeSpinner = sp.active ? sp : null;
 
   return {
@@ -849,11 +874,20 @@ async function main() {
   const outDir = resolve(String(values.out));
   await mkdir(outDir, { recursive: true });
   logPath = join(outDir, '_batch.log');
+  logWriter.setPath(logPath);
 
-  // 버전 배너. 진행바와 달리 **일반 로그 줄**이고 _batch.log에도 남는다 — 나중에
-  // "이 보고서를 어느 버전으로 뽑았나"를 로그만 보고 알 수 있어야 하기 때문이다
-  // (산출물 frontmatter의 scout_version과 같은 목적, 다른 자리).
-  log(`youtube-scout v${scoutVersion}`);
+  // 버전 배너. **화면과 파일에서 다른 모습이어야 한다.**
+  //
+  // 화면: 타임스탬프 없이 빈 줄로 감싼 독립 줄. 예전에는 log()로 냈더니 뒤따르는
+  //   강등 안내·메타 조회 줄과 똑같은 생김새라 배너로 읽히지 않았다
+  //   (실사용 관찰 2026-07-31: 사용자가 "배너가 없다"고 보고했다).
+  // 파일: 타임스탬프를 붙여 남긴다. "이 보고서를 어느 버전으로 뽑았나"가 사후 추적의
+  //   근거라, 로그에는 다른 줄과 같은 형식으로 있어야 시각을 대조할 수 있다.
+  const banner = `youtube-scout v${scoutVersion}`;
+  show('');
+  show(banner);
+  show('');
+  logFile(stamp(banner));
 
   // run.bat을 쓰지 않고 npx를 직접 치는 사용자에게는 update-check.js 경로가 없다.
   // 여기서 같은 API를 보고 알려만 준다 — **캐시를 지우지는 않는다.** 실행 중인 자기 파일을
@@ -1114,10 +1148,17 @@ async function main() {
 }
 
 // 프로세스를 입력 대기로 붙잡지 않는다. 배치가 끝나면 즉시 종료된다.
+//
+// 다만 종료 직전에 로그 큐는 비운다. 큐를 남긴 채 process.exit하면 마지막 줄들이
+// 유실되어 화면의 요약과 _batch.log가 어긋난다 — 로그를 근거로 쓸 수 없게 된다.
 main()
-  .then((code) => process.exit(code))
-  .catch((e) => {
+  .then(async (code) => {
+    await flushLog();
+    process.exit(code);
+  })
+  .catch(async (e) => {
     // 키가 메시지에 섞여 들어갈 여지를 없애기 위해 스택은 그대로 두되 별도 처리하지 않는다.
     console.error(`오류: ${e instanceof Error ? e.message : String(e)}`);
+    await flushLog(); // 실패한 실행일수록 로그가 남아야 한다
     process.exit(1);
   });
