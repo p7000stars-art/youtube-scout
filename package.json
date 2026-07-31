@@ -1,6 +1,6 @@
 {
   "name": "youtube-scout",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "유튜브 영상의 화면 정보까지 회수해 구조화된 보고서를 내는 정찰병 CLI",
   "license": "MIT",
   "type": "module",
