@@ -135,3 +135,86 @@ test('非TTY에서는 스피너가 아무것도 쓰지 않는다', () => {
     process.stdout.write = orig;
   }
 });
+
+// ── spinner delayMs (지연 등장) ─────────────────────────────────────
+//
+// 금방 끝나는 작업에 스피너를 걸면 프레임 몇 개가 깜빡였다 사라진다. 그건 정보가 아니라
+// 산만함이다. waitVisible이 3초 미만 대기에 카운트다운을 띄우지 않는 것과 같은 원칙이다.
+
+/**
+ * TTY인 척하는 가짜 출력 스트림.
+ * 실제 process.stdout을 가로채면 테스트 러너의 TAP 출력까지 함께 삼킨다 — 그래서
+ * spinner에 out 이음매를 두고 여기서 그것을 쓴다.
+ */
+function fakeTty() {
+  /** @type {string[]} */
+  const writes = [];
+  return { isTTY: true, write: (s) => { writes.push(String(s)); return true; }, writes };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('delayMs 전에 done()하면 화면에 아무것도 남지 않는다', async () => {
+  const out = fakeTty();
+  const sp = spinner((f) => `[####------] 메타 조회 ${f}`, { delayMs: 200, out });
+
+  await sleep(30); // 지연 시간 한참 전에 끝나는 짧은 실행
+  sp.done('');
+  assert.deepEqual(out.writes, [], '프레임 한 조각도 그리지 않았다');
+
+  await sleep(250); // 지연 시간이 지나도 되살아나지 않는다
+  assert.deepEqual(out.writes, [], 'done 이후에는 타이머가 죽어 있다');
+});
+
+test('delayMs를 넘겨 계속 진행 중이면 그때 등장한다', async () => {
+  const out = fakeTty();
+  const sp = spinner(() => '[####------] 메타 조회 2/30', { delayMs: 60, out });
+  assert.deepEqual(out.writes, [], '생성 직후에는 아무것도 없다');
+
+  await sleep(140);
+  assert.ok(out.writes.length > 0, '지연을 넘기면 그린다');
+  assert.ok(out.writes.join('').includes('메타 조회 2/30'));
+  sp.done('');
+});
+
+test('delayMs 전에 clear()해도 깨지지 않는다 (로그 줄이 끼어드는 상황)', () => {
+  const out = fakeTty();
+  const sp = spinner(() => 'x', { delayMs: 60, out });
+  sp.clear(); // 그린 것이 없으니 지울 것도 없다
+  assert.deepEqual(out.writes, []);
+  sp.done('');
+});
+
+test('delayMs 전에는 resume()도 그리지 않는다 (지연이 무의미해지면 안 된다)', () => {
+  const out = fakeTty();
+  const sp = spinner(() => 'x', { delayMs: 200, out });
+  sp.pause();
+  sp.resume();
+  assert.deepEqual(out.writes, []);
+  sp.done('');
+});
+
+test('delayMs 미지정이면 종전처럼 첫 프레임을 즉시 그린다 (기존 호출부 회귀)', () => {
+  const out = fakeTty();
+  const sp = spinner((f) => `추출 중 ${f}`, { out });
+  assert.ok(out.writes.length > 0, '생성 즉시 한 프레임');
+  assert.ok(out.writes.join('').includes('추출 중'));
+  sp.done('');
+});
+
+test('delayMs를 줘도 done(텍스트)는 최종 줄을 남긴다', () => {
+  const out = fakeTty();
+  const sp = spinner(() => 'x', { delayMs: 500, out });
+  sp.done('   저장: seg-0000-0480.md');
+  assert.equal(out.writes.join(''), '   저장: seg-0000-0480.md\n');
+});
+
+test('非TTY 스트림이면 delayMs와 무관하게 아무것도 쓰지 않는다', () => {
+  /** @type {string[]} */
+  const writes = [];
+  const out = { isTTY: false, write: (s) => { writes.push(String(s)); return true; } };
+  const sp = spinner(() => 'x', { delayMs: 10, out });
+  assert.equal(sp.active, false);
+  sp.done('');
+  assert.deepEqual(writes, []);
+});

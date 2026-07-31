@@ -72,10 +72,23 @@ export function displayWidth(s) {
  *   매 프레임 화면에 쓸 문자열을 돌려준다. 현재 프레임 문자를 인자로 받으므로
  *   문장 안 어디에 넣을지(또는 아예 쓰지 않을지)를 호출자가 정한다 —
  *   카운트다운처럼 프레임이 불필요한 줄에도 같은 primitive를 쓴다.
+ * @param {{ delayMs?: number, out?: { isTTY?: boolean, write: (s: string) => unknown } }} [opts]
+ *   `out`은 테스트 이음매다 — 실제 `process.stdout`을 가로채면 테스트 러너의 출력까지
+ *   함께 삼켜 버린다. 기본값은 `process.stdout`이라 실사용 동작은 그대로다.
+ *
+ *   `delayMs`가 있으면 그 시간이 지나기 전에는 **한 글자도 그리지 않는다.**
+ *   그 전에 `done()`·`pause()`가 오면 화면에 아무것도 남지 않는다.
+ *
+ *   왜 필요한가: 금방 끝나는 작업에 스피너를 걸면 프레임 몇 개가 깜빡였다 사라진다.
+ *   그건 정보가 아니라 산만함이다. 같은 판단을 이미 `waitVisible`이 하고 있다 —
+ *   3초 미만 대기에는 카운트다운을 띄우지 않는다. 오래 걸릴 때만 나타나는 것이
+ *   "살아있음"을 알린다는 목적에 부합한다.
+ *
+ *   기본값 0이라 기존 호출부의 동작은 달라지지 않는다 (첫 프레임 즉시 그리기).
  * @returns {Spinner}
  */
-export function spinner(labelFn) {
-  const out = process.stdout;
+export function spinner(labelFn, opts = {}) {
+  const { delayMs = 0, out = process.stdout } = opts;
 
   // 非TTY: 완전 무동작. done()만 최종 줄을 평범하게 출력한다.
   if (!out.isTTY) {
@@ -110,15 +123,34 @@ export function spinner(labelFn) {
     lastWidth = width;
   };
 
-  draw(); // 첫 프레임은 즉시 — 200ms 동안 아무것도 없으면 멈춘 것처럼 보인다
-
   /**
    * unref 필수. 이걸 빼면 인터벌이 이벤트 루프를 붙잡아 "작업이 끝나면 즉시 종료"
    * 원칙이 깨진다 (사용자를 입력 대기로 붙잡지 않는다는 것과 같은 규칙).
    * @type {NodeJS.Timeout|null}
    */
-  let timer = setInterval(draw, FRAME_MS);
-  timer.unref();
+  let timer = null;
+
+  /** 등장 대기 타이머. 이게 살아 있는 동안에는 화면에 아무것도 없다. @type {NodeJS.Timeout|null} */
+  let delayTimer = null;
+
+  /** 아직 한 번도 등장하지 않았는가. pause/resume이 지연을 건너뛰지 않게 하는 표시다. */
+  let pendingDelay = delayMs > 0;
+
+  const begin = () => {
+    delayTimer = null;
+    pendingDelay = false;
+    draw(); // 첫 프레임은 즉시 — 200ms 동안 아무것도 없으면 멈춘 것처럼 보인다
+    timer = setInterval(draw, FRAME_MS);
+    timer.unref();
+  };
+
+  const arm = () => {
+    delayTimer = setTimeout(begin, delayMs);
+    delayTimer.unref(); // 등장을 기다리느라 종료가 늦어지면 안 된다
+  };
+
+  if (pendingDelay) arm();
+  else begin();
 
   /** done() 이후에는 resume으로 되살아나지 않아야 한다. */
   let finished = false;
@@ -127,6 +159,10 @@ export function spinner(labelFn) {
     if (timer) {
       clearInterval(timer);
       timer = null;
+    }
+    if (delayTimer) {
+      clearTimeout(delayTimer);
+      delayTimer = null;
     }
   };
 
@@ -149,7 +185,13 @@ export function spinner(labelFn) {
       erase();
     },
     resume() {
-      if (finished || timer) return;
+      if (finished || timer || delayTimer) return;
+      // 아직 등장 전이면 지연을 다시 건다. 여기서 그려 버리면 pause/resume 한 번으로
+      // 지연이 무의미해진다 (짧은 실행에서 깜빡이지 않게 하려던 것이 목적이다).
+      if (pendingDelay) {
+        arm();
+        return;
+      }
       draw(); // 즉시 한 프레임 — 재개가 200ms 뒤에 보이면 멈춘 것처럼 읽힌다
       timer = setInterval(draw, FRAME_MS);
       timer.unref();
