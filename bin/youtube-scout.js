@@ -79,6 +79,7 @@ import {
 } from './ui.js';
 import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
+import { finishProcess } from './exit.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HARNESS = resolve(HERE, '../prompt/meeting-v1.md');
@@ -1239,16 +1240,20 @@ async function main() {
 
 // 프로세스를 입력 대기로 붙잡지 않는다. 배치가 끝나면 즉시 종료된다.
 //
-// 다만 종료 직전에 로그 큐는 비운다. 큐를 남긴 채 process.exit하면 마지막 줄들이
-// 유실되어 화면의 요약과 _batch.log가 어긋난다 — 로그를 근거로 쓸 수 없게 된다.
+// 다만 종료 직전에 로그 큐는 비운다. 큐를 남긴 채 끝내면 마지막 줄들이 유실되어
+// 화면의 요약과 _batch.log가 어긋난다 — 로그를 근거로 쓸 수 없게 된다.
+//
+// 종료는 `finishProcess`가 한다. **`process.exit()`를 직접 부르지 않는다** —
+// 네트워크 조회 직후에 끊으면 Windows에서 libuv가 abort한다 (근거는 bin/exit.js).
+// 실측 2026-08-01: `init --refresh-models`가 정확히 이 경로로 2회 모두 크래시했다.
 main()
   .then(async (code) => {
     await flushLog();
-    process.exit(code);
+    finishProcess(code);
   })
   .catch(async (e) => {
     // 키가 메시지에 섞여 들어갈 여지를 없애기 위해 스택은 그대로 두되 별도 처리하지 않는다.
     console.error(`오류: ${e instanceof Error ? e.message : String(e)}`);
     await flushLog(); // 실패한 실행일수록 로그가 남아야 한다
-    process.exit(1);
+    finishProcess(1);
   });
