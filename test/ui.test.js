@@ -15,6 +15,10 @@ import {
   colorEnabled,
   paintBar,
   paintNotice,
+  formatChunkSaved,
+  formatChunkFailed,
+  formatSummaryModels,
+  summaryModelsWidth,
   NO_COLORS,
   BANNER_WIDTH,
   FRAMES,
@@ -496,4 +500,88 @@ test('이상한 입력에도 형태를 유지한다', () => {
 
 test('배치 규모 표기에는 색이 없다 (색은 호출부가 시간에만 입힌다)', () => {
   assert.ok(!formatBatchTotals({ videos: 2, chunks: 3, tokens: 100 }).includes('\x1b'));
+});
+
+// ── 구간 결과 줄의 모델 (실사용 관찰 2026-08-01) ────────────────────
+
+test('저장 줄에 그 구간을 뽑은 모델이 들어간다', () => {
+  assert.equal(
+    formatChunkSaved({ name: 'seg-0000-0480.md', model: 'gemini-flash-latest', tokens: 146247, time: '1m 9s' }),
+    '      저장: seg-0000-0480.md (gemini-flash-latest · 146247 토큰, 1m 9s)',
+  );
+});
+
+test('실패 줄에도 어느 모델에서 실패했는지 들어간다', () => {
+  assert.equal(
+    formatChunkFailed({ reason: 'RPD (전 모델 소진)', model: 'gemini-3.6-flash', time: '4s' }),
+    '      실패: RPD (전 모델 소진) (gemini-3.6-flash · 4s)',
+  );
+});
+
+test('결과 줄 조립기는 색을 만들지 않는다 (파일용 문자열이 여기서 나온다)', () => {
+  const saved = formatChunkSaved({ name: 'seg-0000-0480.md', model: 'm', tokens: 1, time: '1s' });
+  const failed = formatChunkFailed({ reason: 'r', model: 'm', time: '1s' });
+  assert.ok(!saved.includes('\x1b'));
+  assert.ok(!failed.includes('\x1b'));
+});
+
+test('실패 줄의 라벨은 갈아 끼울 수 있다 (화면은 빨강, 파일은 원문)', () => {
+  const painted = formatChunkFailed({
+    label: `\x1b[31m      실패:\x1b[0m`, reason: 'r', model: 'm', time: '1s',
+  });
+  assert.equal(painted.replace(/\x1b\[\d+m/g, ''), '      실패: r (m · 1s)');
+});
+
+// ── 요약표 모델 칸 ──────────────────────────────────────────────────
+
+test('사용 모델은 중복 없이 사용 순서대로 나온다', () => {
+  // 한 모델이 여러 구간을 처리하는 것이 정상이라 그대로 나열하면 (a, a, a)가 된다.
+  const { cell } = formatSummaryModels(['gemini-3.6-flash', 'gemini-3.6-flash'], 30);
+  assert.equal(cell.trim(), '(gemini-3.6-flash)');
+
+  const swapped = formatSummaryModels(['b', 'a', 'b', 'a'], 30);
+  assert.equal(swapped.cell.trim(), '(b, a)', '먼저 쓴 순서를 지킨다');
+});
+
+test('칸에 들어가면 폭에 맞춰 채운다 (표 정렬)', () => {
+  const { cell, extra } = formatSummaryModels(['abc'], 12);
+  assert.equal(cell, '(abc)       ');
+  assert.equal(displayWidth(cell), 12);
+  assert.equal(extra, null);
+});
+
+test('모델이 없으면 빈 칸만 남는다 (재개로 전부 건너뛴 영상)', () => {
+  const { cell, extra } = formatSummaryModels([], 12);
+  assert.equal(cell, ' '.repeat(12));
+  assert.equal(extra, null);
+});
+
+test('폭을 넘는 목록은 칸을 비우고 아래 줄로 내려간다 (표 정렬이 먼저다)', () => {
+  const { cell, extra } = formatSummaryModels(['gemini-3.6-flash', 'gemini-flash-latest'], 22);
+  assert.equal(displayWidth(cell), 22, '칸 폭은 유지된다');
+  assert.equal(cell.trim(), '', '칸은 비어 있다');
+  assert.equal(extra, '모델: gemini-3.6-flash, gemini-flash-latest');
+});
+
+test('칸 폭이 0이면 칸 없이 아래 줄로만 낸다', () => {
+  const { cell, extra } = formatSummaryModels(['a', 'b'], 0);
+  assert.equal(cell, '');
+  assert.equal(extra, '모델: a, b');
+});
+
+test('칸 폭은 실제 내용으로 정하고, 넘치는 행은 폭 계산에서 뺀다', () => {
+  const rows = [['abc'], ['gemini-3.6-flash', 'gemini-flash-latest'], []];
+  // '(abc)' = 5칸. 두 번째 행(40칸)이 폭을 끌어올리면 아무도 쓰지 않는 빈 칸이 표를 밀어낸다.
+  assert.equal(summaryModelsWidth(rows, 22), 5);
+});
+
+test('모델이 하나도 없으면 칸을 만들지 않는다 (폭 0)', () => {
+  assert.equal(summaryModelsWidth([[], []], 22), 0);
+  assert.equal(summaryModelsWidth([], 22), 0);
+});
+
+test('요약표 모델 칸에는 색이 없다 (호출부가 dim만 입힌다)', () => {
+  const { cell, extra } = formatSummaryModels(['a', 'b'], 4);
+  assert.ok(!cell.includes('\x1b'));
+  assert.ok(!String(extra).includes('\x1b'));
 });

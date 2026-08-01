@@ -72,6 +72,10 @@ import {
   colorEnabled,
   paintNotice,
   formatBatchTotals,
+  formatChunkSaved,
+  formatChunkFailed,
+  formatSummaryModels,
+  summaryModelsWidth,
 } from './ui.js';
 import { createLogWriter } from './log-queue.js';
 import { runChunk } from './chunk-runner.js';
@@ -625,6 +629,16 @@ async function runVideo(p) {
   let model = p.model;
   /** @type {Set<string>} 실제로 사용된 모델. 구간마다 다를 수 있어 frontmatter에 모두 남긴다 */
   const usedModels = new Set();
+  /**
+   * 이번 실행에서 이 영상의 구간들이 **결말을 본** 모델. 성공·실패를 가리지 않는다.
+   *
+   * `usedModels`와 일부러 나눈다. 저쪽은 산출물의 출처라 성공한 구간만 각인해야 맞고,
+   * 이쪽은 실행 기록이라 "무엇으로 시도해 어떻게 됐나"가 기준이다. 429·404·503으로 교체가
+   * 일어난 실행에서 실패한 모델이 요약에서 사라지면, 로그를 뒤지기 전에는 교체가 있었다는
+   * 사실 자체를 알 수 없다 (이 수정의 출발점이 그 상황이다).
+   * @type {Set<string>}
+   */
+  const runModels = new Set();
   let done = 0;
   let skipped = 0;
   let failed = 0;
@@ -701,6 +715,7 @@ async function runVideo(p) {
     if (res.ok) {
       model = res.model;
       usedModels.add(res.model);
+      runModels.add(res.model);
       // 받는 즉시 파일로 flush. 뒤 구간에서 터져도 앞 구간은 남는다.
       await writeFile(
         file,
@@ -710,19 +725,34 @@ async function runVideo(p) {
       done += 1;
       tokens += res.tokens;
       // 화면용과 파일용을 따로 만든다 — 색이 섞인 문자열이 파일로 가면 안 된다.
+      //
+      // 모델은 `res.model`이다 — 시작 시 배정된 `p.model`이 아니라 **이 구간이 실제로 성공한
+      // 시점의 모델**이어야 한다. 교체가 있었으면 교체된 쪽이 뽑은 것이고, 산출물 헤더에도
+      // 그 이름이 각인된다(바로 아래 segDocument). 두 곳이 어긋나면 로그가 근거가 못 된다.
       const at = stamp('');
-      const saved = /** @param {string} t */ (t) =>
-        `      저장: ${segFileName(r.start, r.end)} (${res.tokens} 토큰, ${t})`;
-      sp.done(`${at}${saved(timeText(took))}`); // TTY면 스피너 줄을 이 줄로 확정
-      logFile(`${at}${saved(took)}`);
+      const saved = /**
+       * @param {string} m 모델명 (화면용은 dim이 입혀진 문자열)
+       * @param {string} t 소요 시간 표기
+       */ (m, t) =>
+        formatChunkSaved({ name: segFileName(r.start, r.end), model: m, tokens: res.tokens, time: t });
+      // 모델명은 흐리게(dim)만 준다. 시간(노랑)·상태(빨강/초록)와 색으로 경쟁하면
+      // "어디를 봐야 하는가"가 다시 흐려진다.
+      sp.done(`${at}${saved(colors.dim(res.model), timeText(took))}`); // TTY면 스피너 줄을 이 줄로 확정
+      logFile(`${at}${saved(res.model, took)}`);
     } else {
       failed += 1;
+      runModels.add(res.model);
       const at = stamp('');
-      const failed = /** @param {string} t */ (t) => `      실패: ${res.reason} (${t})`;
-      // 실패는 빨강, 시간은 시간색. 한 줄에 두 색이 섞이는 것은 의도된 것이다 —
-      // "무엇이 실패했나"와 "얼마나 태웠나"는 따로 읽혀야 하는 정보다.
-      sp.done(`${at}${colors.red('      실패:')} ${res.reason} (${timeText(took)})`);
-      logFile(`${at}${failed(took)}`);
+      const failLine = /**
+       * @param {string} label 줄머리 (화면용은 빨강)
+       * @param {string} m 모델명
+       * @param {string} t 소요 시간 표기
+       */ (label, m, t) =>
+        formatChunkFailed({ label, reason: res.reason, model: m, time: t });
+      // 실패는 빨강, 시간은 시간색, 모델은 흐리게. 한 줄에 세 색이 섞이는 것은 의도된 것이다 —
+      // "무엇이 실패했나"와 "어느 모델에서"와 "얼마나 태웠나"는 따로 읽혀야 하는 정보다.
+      sp.done(`${at}${failLine(colors.red('      실패:'), colors.dim(res.model), timeText(took))}`);
+      logFile(`${at}${failLine('      실패:', res.model, took)}`);
       if (res.poolEmpty) {
         // 쓸 수 있는 모델이 하나도 남지 않았다. 남은 구간을 계속 시도해도 같은 결과이므로
         // 헛손질을 하지 않고 다음 실행으로 이월한다.
@@ -775,8 +805,11 @@ async function runVideo(p) {
     log(`   ⛔ 누락 구간 ${merged.missing.length}개 — 병합본에 표시됨`);
   }
   log(`   병합: ${merged.path} (${merged.okChunks}/${merged.totalChunks} 구간)`);
+  // 영상 단위 집계도 로그 파일에 남긴다. 구간 줄마다 모델이 있으므로 복원은 가능하지만,
+  // 교체 여부를 확인하려고 수십 줄을 대조하게 만들 이유가 없다. 화면 요약과 같은 값이다.
+  if (runModels.size) log(`   사용 모델: ${[...runModels].join(', ')}`);
 
-  return { done, skipped, failed, tokens, merged, carriedOver };
+  return { done, skipped, failed, tokens, merged, carriedOver, models: [...runModels] };
 }
 
 // ── 진입점 ──────────────────────────────────────────────────────────
@@ -1099,7 +1132,8 @@ async function main() {
     if (!model) {
       // 전 모델 RPD 소진 — 남은 영상은 손대지 않고 이월한다
       log(`[${i + 1}/${batch.plans.length}] ${p.id} — 전 모델 일일 한도 소진, 이월`);
-      summary.push({ id: p.id, title: p.title, done: 0, total: p.calls, note: '이월 (RPD)' });
+      // 모델을 배정받지 못했으니 쓴 모델도 없다. 빈 배열로 모양을 맞춰 둔다.
+      summary.push({ id: p.id, title: p.title, done: 0, total: p.calls, note: '이월 (RPD)', models: [] });
       continue;
     }
 
@@ -1124,6 +1158,8 @@ async function main() {
       total: p.calls,
       note: r.carriedOver ? '이월 (RPD)' : r.failed ? `실패 ${r.failed}` : '',
       path: r.merged.path,
+      // 배정된 모델(위 `model`)이 아니라 구간들이 실제로 결말을 본 모델이다.
+      models: r.models,
     });
   }
 
@@ -1131,6 +1167,9 @@ async function main() {
   show('');
   show('요약');
   show('─'.repeat(60));
+  // 모델 칸의 폭은 실제 내용으로 정한다. 한 종만 쓴 행은 칸에 들어가고, 교체가 있어
+  // 목록이 길어진 행은 칸을 비우고 바로 아래 줄로 내려간다 (표 정렬이 먼저다).
+  const modelWidth = summaryModelsWidth(summary.map((s) => s.models ?? []));
   for (const s of summary) {
     const ok = s.done === s.total;
     // 기호는 그대로 두고 색만 입힌다 — 색을 꺼도 ✓/⛔로 읽을 수 있어야 한다.
@@ -1139,7 +1178,13 @@ async function main() {
     // 색을 먼저 입히면 표 정렬이 무너진다.
     const note = s.note.padEnd(12);
     const painted = s.note.startsWith('실패') ? colors.red(note) : note;
-    show(`  ${mark} ${String(s.done).padStart(3)}/${String(s.total).padEnd(3)} ${painted} ${s.title || s.id}`);
+    // 모델은 dim만 준다 — 상태(초록/빨강)와 색으로 다투면 안 된다. 칸 채우기도 색 입히기
+    // 전에 끝내 둔다(같은 이유).
+    const { cell, extra } = formatSummaryModels(s.models ?? [], modelWidth);
+    const models = cell ? `${cell.trim() ? colors.dim(cell) : cell} ` : '';
+    show(`  ${mark} ${String(s.done).padStart(3)}/${String(s.total).padEnd(3)} ${painted} ${models}${s.title || s.id}`);
+    // 칸에 못 들어간 목록. 표 아래가 아니라 그 행 바로 밑이라야 어느 영상 것인지 알 수 있다.
+    if (extra) show(`        ${colors.dim(extra)}`);
   }
   show('─'.repeat(60));
   if (pool.exhausted.size) {

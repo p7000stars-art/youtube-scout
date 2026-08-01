@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { runChunk } from '../bin/chunk-runner.js';
 import { ExtractError } from '../src/extract.js';
 import { ModelPool } from '../src/quota.js';
+import { formatChunkSaved, formatChunkFailed } from '../bin/ui.js';
 
 /**
  * TPM 경로가 한 모델에 주는 시도 횟수 (초기 1회 + 재시도 1회).
@@ -434,4 +435,57 @@ test('한 모델에서 서로 다른 실패가 겹치면 두 번째에 교체한
   assert.equal(res.ok, true);
   assert.equal(res.model, 'B');
   assert.equal(mock.countFor('A'), 2);
+});
+
+// ── 결과 줄의 모델 (실사용 관찰 2026-08-01) ─────────────────────────
+// 저장·실패 줄이 쓰는 값은 시작 시 배정된 모델이 아니라 **그 구간이 결말을 본 모델**이다.
+// 조립은 ui.js가 하므로, 여기서는 교체가 겹친 시퀀스에서 runChunk가 내주는 model이
+// 교체된 쪽인지를 그 줄에 그대로 넣어 확인한다.
+
+test('교체 뒤 성공하면 저장 줄의 모델은 교체된 쪽이다', async () => {
+  const { promise } = run(['old', 'new'], { old: ['rpd'], new: ['ok'] });
+  const res = await promise;
+
+  assert.equal(res.ok, true);
+  const line = formatChunkSaved({
+    name: 'seg-0000-0480.md', model: res.model, tokens: 146247, time: '1m 9s',
+  });
+  assert.equal(line, '      저장: seg-0000-0480.md (new · 146247 토큰, 1m 9s)');
+  assert.ok(!line.includes('old'), '배정 당시 모델이 남지 않는다');
+});
+
+test('교체가 여러 번 겹쳐도 저장 줄은 마지막 모델을 쓴다', async () => {
+  // 실측 로그의 순서: 404 교체 → RPD 교체 → TPM 대기 → 성공.
+  const { promise } = run(
+    ['A', 'B', 'C'],
+    { A: ['404'], B: ['rpd'], C: ['tpm', 'ok'] },
+  );
+  const res = await promise;
+
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'C');
+  assert.match(
+    formatChunkSaved({ name: 'seg-0475-0955.md', model: res.model, tokens: 1, time: '2s' }),
+    /\(C · /,
+  );
+});
+
+test('실패 줄도 마지막으로 시도한 모델을 쓴다', async () => {
+  // A가 퇴역(404)으로 빠지고 B에서 실제로 실패했다. 실패한 곳은 B다.
+  const { promise } = run(['A', 'B'], { A: ['404'], B: ['500'] });
+  const res = await promise;
+
+  assert.equal(res.ok, false);
+  if (res.ok === false) {
+    assert.equal(res.model, 'B');
+    const line = formatChunkFailed({ reason: res.reason, model: res.model, time: '50s' });
+    assert.match(line, /^      실패: .* \(B · 50s\)$/);
+  }
+});
+
+test('교체가 없으면 저장 줄의 모델은 배정된 모델 그대로다', async () => {
+  const { promise } = run(['solo'], { solo: ['ok'] });
+  const res = await promise;
+  assert.equal(res.ok, true);
+  assert.equal(res.model, 'solo');
 });
