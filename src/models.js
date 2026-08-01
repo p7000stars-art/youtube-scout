@@ -12,6 +12,8 @@
  * 호출해도 본 작업의 예산을 깎지 않는다. 이것이 부팅 대조를 넣을 수 있는 전제다.
  */
 
+import { discardBody } from './http.js';
+
 const MODELS_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /** 부팅 대조는 보조 기능이다. 본 작업(청크 300초)보다 훨씬 짧게 끊어 실행을 붙잡지 않는다. */
@@ -93,10 +95,23 @@ export async function fetchAvailableModels(apiKey, opts = {}) {
     // "제공되지 않는다"로 오판되고, 사용자가 쓰던 모델이 조용히 제외된다.
     const res = await fetchImpl(`${MODELS_ENDPOINT}?pageSize=1000`, {
       signal: ac.signal,
-      headers: { 'x-goog-api-key': apiKey },
+      headers: {
+        'x-goog-api-key': apiKey,
+        // 실행당 한 번 쓰고 끝나는 요청이라 연결을 재사용할 이유가 없다. 그리고 이 조회
+        // **직후에 프로세스가 끝나는 경로**가 있다(init --refresh-models). 살아남은
+        // keep-alive 소켓이 종료 시점까지 남으면 Windows에서 libuv가 abort한다
+        // (실측 2026-08-01. 근거는 bin/exit.js). 정상 실행에서 잃는 것은 첫 추출 호출의
+        // 연결 재사용 한 번뿐이고, 청크 간격이 6초라 어차피 keep-alive는 끊겨 있다.
+        connection: 'close',
+      },
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // **본문을 버리더라도 스트림은 닫아야 한다.** 읽지 않은 본문은 소켓을 붙잡고,
+      // 그 소켓이 종료 시점까지 남는다 (update-check.js가 먼저 맞은 것과 같은 결함).
+      await discardBody(res);
+      return null;
+    }
 
     const models = filterModels(await res.json());
 

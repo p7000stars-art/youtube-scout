@@ -227,6 +227,9 @@ export async function fetchLatestCommitMs(opts = {}) {
 
 /**
  * 쓰지 않을 응답 본문을 닫는다. 실패해도 무시한다 — 이미 닫혔거나 본문이 없는 경우다.
+ *
+ * `src/http.js`에 같은 함수가 있고 **일부러 사본을 둔다.** 이 파일은 init이 사용자 실행
+ * 폴더에 그대로 복사해 두는 독립 실행 스크립트라 저장소 안의 모듈을 import할 수 없다.
  * @param {Response} res
  */
 async function discardBody(res) {

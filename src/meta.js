@@ -12,6 +12,8 @@
  * watch 페이지는 키 없이 읽히고, 재생 가능 여부(playabilityStatus)까지 같이 준다.
  */
 
+import { discardBody } from './http.js';
+
 /** watch 페이지 fetch 타임아웃. 응답이 없는 채로 배치가 멈추지 않게 한다. */
 export const META_TIMEOUT_MS = 60_000;
 
@@ -193,6 +195,9 @@ export async function fetchMeta(input, opts = {}) {
     });
 
     if (!res.ok) {
+      // 본문을 쓰지 않는 분기다. 읽지 않은 본문은 소켓을 붙잡고 종료 시점까지 남는다
+      // (근거는 src/http.js — Windows 종료 크래시의 조건이었다).
+      await discardBody(res);
       return {
         id,
         url,
