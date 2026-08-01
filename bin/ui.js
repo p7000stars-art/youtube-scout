@@ -450,6 +450,113 @@ export function formatBatchTotals(p) {
   return parts.join(' · ');
 }
 
+// ── 구간 결과 줄 ────────────────────────────────────────────────────
+/**
+ * ## 왜 결과 줄에 모델명을 넣는가 (실사용 관찰 2026-08-01)
+ * 모델명이 나오는 곳은 영상 시작 줄 하나뿐이었다. 그런데 429·404·503이면 구간 도중에
+ * 모델이 교체되므로 시작 줄의 모델과 실제로 뽑은 모델이 다를 수 있다. 추출 중에는
+ * 스피너가 현재 모델을 보여주지만 완료되는 순간 그 줄이 결과 줄로 덮여 사라진다 —
+ * **`_batch.log`만 읽으면 어느 모델로 뽑았는지 알 수 없었다.**
+ *
+ * 데이터 자체는 seg 헤더와 frontmatter에 이미 각인돼 있다. 없던 것은 "실행 기록"이다.
+ * 그래서 조립만 여기서 하고, 색은 호출자가 미리 입혀서 넣는다 — 이 함수가 색을 알면
+ * 파일용 문자열에도 이스케이프가 섞일 길이 생긴다 (색 있는 문자열은 파일에 쓰지 않는다).
+ */
+
+/**
+ * 구간 저장 줄.
+ *
+ * @param {{ name: string, model: string, tokens: number|string, time: string }} p
+ *   `model`·`time`은 이미 칠해진 문자열일 수 있다. 조립만 한다.
+ * @returns {string} 예: `      저장: seg-0000-0480.md (gemini-flash-latest · 146247 토큰, 1m 9s)`
+ */
+export function formatChunkSaved(p) {
+  return `      저장: ${p.name} (${p.model} · ${p.tokens} 토큰, ${p.time})`;
+}
+
+/**
+ * 구간 실패 줄. 저장 줄과 같은 자리에 같은 모양으로 모델을 넣는다 —
+ * "어느 모델에서 실패했나"는 "어느 모델로 뽑았나"와 같은 무게의 사실이다.
+ *
+ * @param {{ label?: string, reason: string, model: string, time: string }} p
+ *   `label`은 화면에서 빨강으로 칠해 넣기 위한 이음매다 (파일에는 원문을 그대로 준다).
+ * @returns {string}
+ */
+export function formatChunkFailed(p) {
+  return `${p.label ?? '      실패:'} ${p.reason} (${p.model} · ${p.time})`;
+}
+
+// ── 요약표 모델 칸 ──────────────────────────────────────────────────
+/**
+ * 요약표 모델 칸의 최대 폭.
+ *
+ * 모델명 하나(`gemini-flash-latest` 등)는 칸에 들어가지만, 교체가 일어나 둘 이상이 되면
+ * 40칸을 넘어 제목을 화면 밖으로 밀어낸다. **표 정렬이 먼저다** — 넘치는 목록은 칸을 비우고
+ * 바로 아래 줄로 내린다. 교체가 있었다는 사실 자체가 눈에 걸려야 할 정보이기도 하다.
+ */
+export const SUMMARY_MODELS_MAX = 22;
+
+/**
+ * 사용 순서를 지키며 중복만 제거한다. 같은 모델이 여러 구간을 처리하는 것이 정상이라
+ * 그대로 나열하면 `(a, a, a)`가 된다.
+ * @param {string[]} [models]
+ * @returns {string[]}
+ */
+function dedupeModels(models) {
+  return [...new Set((models ?? []).filter(Boolean).map(String))];
+}
+
+/**
+ * 모델 칸의 폭을 실제 내용으로 정한다.
+ *
+ * 상한을 넘는 행은 계산에서 뺀다 — 그 행은 어차피 아래 줄로 내려가므로, 폭까지 끌어올리면
+ * 아무도 쓰지 않는 빈 칸이 표 전체를 밀어낸다. 모델이 하나도 없으면 0을 돌려준다
+ * (전부 재개로 건너뛴 배치에서 빈 칸만 남기지 않기 위해서다).
+ *
+ * @param {string[][]} rows 행별 사용 모델 목록
+ * @param {number} [max]
+ * @returns {number} 0이면 칸을 만들지 않는다
+ */
+export function summaryModelsWidth(rows, max = SUMMARY_MODELS_MAX) {
+  let w = 0;
+  for (const models of rows ?? []) {
+    const width = displayWidth(cellText(dedupeModels(models)));
+    if (width && width <= max) w = Math.max(w, width);
+  }
+  return w;
+}
+
+/** @param {string[]} list */
+function cellText(list) {
+  return list.length ? `(${list.join(', ')})` : '';
+}
+
+/**
+ * 요약표 한 행의 모델 칸.
+ *
+ * @param {string[]} models 사용 순서대로 (중복 허용 — 여기서 제거한다)
+ * @param {number} [width] `summaryModelsWidth`가 정한 폭. 0이면 칸 없이 아래 줄로만 낸다
+ * @returns {{ cell: string, extra: string|null }}
+ *   `cell`은 폭에 맞춰 채운 문자열(색은 호출자가 입힌다), `extra`는 표 아래에 낼 한 줄이다.
+ */
+export function formatSummaryModels(models, width = SUMMARY_MODELS_MAX) {
+  const list = dedupeModels(models);
+  const w = Math.max(0, Number.isFinite(width) ? Number(width) : 0);
+  const text = cellText(list);
+
+  if (text && displayWidth(text) <= w) return { cell: pad(text, w), extra: null };
+  return { cell: pad('', w), extra: list.length ? `모델: ${list.join(', ')}` : null };
+}
+
+/**
+ * 표시 폭 기준 오른쪽 채우기. `padEnd`는 한글을 한 칸으로 세어 표를 무너뜨린다.
+ * @param {string} text
+ * @param {number} width
+ */
+function pad(text, width) {
+  return text + ' '.repeat(Math.max(0, width - displayWidth(text)));
+}
+
 /**
  * 경과·잔여 시간 표기. 초 미만은 버린다 (밀리초는 사람이 읽을 정보가 아니다).
  *
