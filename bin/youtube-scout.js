@@ -39,6 +39,7 @@ import {
   resolvePool,
   reconcileMessages,
   sortModelPool,
+  isAliasModel,
 } from '../src/models.js';
 import {
   STATUS_FILE_NAME,
@@ -1078,10 +1079,16 @@ async function main() {
   // 한도 추정은 **실패 이력이 없는 모델 수**로 낸다. 풀 크기로 세면 강등·차단된 모델까지
   // 한도를 채워 주는 것으로 계산돼 3~5배 낙관적인 숫자가 나오고(실측 2026-07-31: 15종 풀에
   // 실질 가용 4종), 그 숫자를 믿고 진행한 실행이 첫 청크부터 429를 맞았다.
+  //
+  // 별칭(`-latest`)도 세지 않는다. 별칭은 이름일 뿐 실체가 아니라, 가리키는 모델이 목록의
+  // 명시 모델과 같으면 두 칸으로 보이는 것이 실제로는 한 칸이다 (쿼터는 모델별 분리).
+  // 실행에서 빼는 것이 아니라 예산을 부풀리지 않는 것이다 — 별칭은 순환에 그대로 남는다.
+  // "무엇이 별칭인가"의 판정은 models.js가 하고, plan.js는 집합 연산만 한다.
   const budget = budgetEstimate({
-    poolSize: pool.models.length,
-    demotedCount: demotedModels.size,
-    blockedCount: blockedModels.size,
+    pool: pool.models,
+    demoted: [...demotedModels],
+    blocked: [...blockedModels],
+    aliases: pool.models.filter(isAliasModel),
   });
 
   const batch = planBatch(
