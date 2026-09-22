@@ -18,9 +18,6 @@
 /** 실측: TPM 회복 대기 상한. 이보다 길게 기다릴 바엔 모델을 바꾸는 게 빠르다. */
 export const MAX_RETRY_WAIT_MS = 90_000;
 
-/** 실측: TPM/RPM 재시도 횟수. */
-export const MAX_RETRIES = 3;
-
 /** 서버 권고 지연에 얹는 여유. 권고값 경계에서 곧바로 다시 튕기는 것을 막는다. */
 export const RETRY_PADDING_MS = 3_000;
 
