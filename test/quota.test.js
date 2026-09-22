@@ -9,7 +9,6 @@ import {
   forbiddenMessage,
   ModelPool,
   MAX_RETRY_WAIT_MS,
-  MAX_RETRIES,
   CALL_INTERVAL_MS,
 } from '../src/quota.js';
 
@@ -177,7 +176,6 @@ test('assign은 순환을 유지한다 (영상을 모델에 흩어 RPD를 합쳐
 });
 
 test('기본 상수는 실측치', () => {
-  assert.equal(MAX_RETRIES, 3);
   assert.equal(CALL_INTERVAL_MS, 6_000);
 });
 
