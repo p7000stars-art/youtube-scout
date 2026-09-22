@@ -77,12 +77,26 @@ async function makeCwd() {
   return mkdtemp(join(tmpdir(), 'yt-scout-exit-'));
 }
 
-test('init — 모델 조회 뒤에 끝나는데도 깨끗하게 종료한다', async () => {
+test('init — 깨끗하게 종료한다 (2026-09-22부터 네트워크를 타지 않는다)', async () => {
+  // run 파일의 MODELS가 비어 있는 자동 모드로 바뀌면서 init은 모델 목록을 조회하지 않는다.
+  // 조회 결과를 쓸 곳이 없기 때문이다 — 목록은 실행할 때마다 다시 정해진다.
   const cwd = await makeCwd();
   const r = await runCli(['init'], { cwd });
 
   assertCleanExit(r, 'init');
   assert.equal(r.code, 0, 'init 자체는 키·네트워크와 무관하게 성공한다');
+});
+
+test('값 없이 꼬리에 붙은 --models 는 인자 오류가 아니라 자동 모드다', async () => {
+  // 이 판 이전에 만들어진 run.bat에는 `--models %MODELS%` 가 박혀 있다. 자동 모드로
+  // 바꾸려고 MODELS 줄을 비우면 cmd가 빈 값을 아무것도 아닌 것으로 펼쳐, 인자가
+  // `--models` 하나만 남은 채 넘어온다. 안내대로 한 사용자가 "인자 오류"를 보면 안 된다.
+  const cwd = await makeCwd();
+  const r = await runCli(['init', '--models'], { cwd });
+
+  assertCleanExit(r, 'bare --models');
+  assert.equal(r.code, 0, `인자 오류로 끝났다\n${r.stdout}`);
+  assert.doesNotMatch(r.stdout, /인자 오류/);
 });
 
 test('init --refresh-models — 실측 크래시가 났던 바로 그 경로', async () => {

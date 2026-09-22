@@ -16,6 +16,22 @@ import { discardBody } from './http.js';
 
 const MODELS_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
+/**
+ * **조회 실패 시 폴백 전용.** 저장소 코드에 남는 유일한 모델명이다.
+ *
+ * ## 왜 기본 모델이 아니라 폴백인가 (실측 2026-09-22)
+ * 예전에는 이 이름이 `--models`의 기본값이었다. 그 결과 외부 자동화 환경에서 `init` 없이
+ * 직접 호출하는 경로가 이 단일 모델로만 돌았고, `init`에만 적용되던 신형 우선 정렬의
+ * 이득을 받지 못했다. 그 실행에서 503 재발로 모델을 교체할 때 API 목록 순서 그대로 붙어
+ * 있던 꼬리를 밟아 좀비 모델(404)을 먼저 들이받았다.
+ *
+ * 그래서 기본값을 없애고, 목록을 지정하지 않으면 조회된 가용 모델 전체를 정렬해 쓴다.
+ * 이 이름이 쓰이는 경우는 **조회가 실패해 판단 근거가 아예 없을 때 한 번**뿐이다.
+ * 모델 세대교체가 빠르므로 이 이름도 언젠가 죽는다 — 그때도 도구가 "아무것도 못 한다"가
+ * 아니라 "한 번은 시도해 보고 그 결과를 보고한다"가 되도록 두는 최후의 값이다.
+ */
+export const FALLBACK_MODEL = 'gemini-3.6-flash';
+
 /** 부팅 대조는 보조 기능이다. 본 작업(청크 300초)보다 훨씬 짧게 끊어 실행을 붙잡지 않는다. */
 export const MODELS_TIMEOUT_MS = 30_000;
 
@@ -139,6 +155,14 @@ export async function fetchAvailableModels(apiKey, opts = {}) {
  * 꼬리에 두면 검증된 풀이 RPD로 소진됐을 때만 쓰인다. 써 보고 좋았으면 사용자가
  * run 파일에서 직접 앞으로 승격한다 — 그 수동 승격이 검증 게이트다.
  *
+ * ## 꼬리 **안에서는** 정렬한다 (실측 2026-09-22)
+ * 편입 자체는 꼬리지만, 꼬리 안의 순서까지 API 목록 순서로 두면 안 된다. 실측에서
+ * 편입된 13종이 API 순서 그대로 붙어 구세대·별칭이 앞, 최신 세대가 맨 뒤였다.
+ * 그 상태로 앞쪽 모델이 503으로 교체됐을 때 순환이 좀비 모델(404)부터 밟았다.
+ * 꼬리에 닿았다는 것은 이미 검증 풀이 소진됐다는 뜻이므로, 그때만이라도 살아 있을
+ * 가능성이 높은 쪽부터 밟게 한다 — `sortModelPool`과 **같은 함수**를 쓴다
+ * (규칙이 두 곳에 갈라지면 반드시 어긋난다).
+ *
  * @param {string[]} userPool 사용자가 지정한 모델 목록 (순서가 우선순위다)
  * @param {string[]|null} available 조회 결과. null이면 대조를 생략한다
  * @returns {{ pool: string[], removed: string[], appended: string[] }}
@@ -154,9 +178,40 @@ export function reconcilePool(userPool, available) {
 
   const pool = user.filter((m) => have.has(m));
   const removed = user.filter((m) => !have.has(m));
-  const appended = available.filter((m) => !inUser.has(m));
+  // 사용자 목록의 순서는 그대로 두고, 꼬리에 붙는 편입분만 정렬한다.
+  const appended = sortModelPool(available.filter((m) => !inUser.has(m)));
 
   return { pool: [...pool, ...appended], removed, appended };
+}
+
+/**
+ * 이번 실행에 쓸 모델 풀을 결정한다. 부팅 대조의 유일한 진입점이다.
+ *
+ * ## 세 갈래 (실측 2026-09-22)
+ * - **자동** — 목록을 지정하지 않았다. 조회된 가용 모델 **전체**를 신형 우선으로 세운다.
+ *   목록을 안 주면 다음 세대가 나오는 즉시 맨 앞에 오므로, 사용자가 아무것도 안 해도
+ *   실행이 살아 있는 구간부터 밟는다.
+ * - **사용자** — 목록을 명시했다. 그 순서는 사용자의 검증 게이트라 도구가 재정렬하지
+ *   않는다(`reconcilePool`). 명시 목록은 이제 "기본값"이 아니라 **고정 옵션**이다.
+ * - **폴백** — 목록도 없고 조회도 실패했다. 판단 근거가 아예 없는 유일한 경우이고,
+ *   이때만 `FALLBACK_MODEL` 한 종으로 진행한다.
+ *
+ * @param {string[]} requested 사용자가 지정한 목록. 비어 있으면 자동 모드다
+ * @param {string[]|null} available 조회 결과. null이면 조회 실패
+ * @returns {{ pool: string[], mode: 'auto'|'user'|'fallback', removed: string[], appended: string[] }}
+ */
+export function resolvePool(requested, available) {
+  const user = (requested ?? []).map((m) => String(m).trim()).filter(Boolean);
+
+  if (user.length) {
+    return { ...reconcilePool(user, available), mode: 'user' };
+  }
+
+  if (available && available.length) {
+    return { pool: sortModelPool(available), mode: 'auto', removed: [], appended: [] };
+  }
+
+  return { pool: [FALLBACK_MODEL], mode: 'fallback', removed: [], appended: [] };
 }
 
 /**
@@ -242,12 +297,36 @@ export function sortModelPool(models) {
 
 /**
  * 대조 결과 안내 문구. 출력은 호출자(bin)가 한다.
- * @param {{ removed: string[], appended: string[] }} r
+ *
+ * 자동 모드·폴백은 "사용자 목록과 대조한 결과"가 아니라 **목록을 어떻게 정했는지**의
+ * 보고라 문구 계열이 다르다. 제외/편입 문구를 그대로 쓰면 자동 모드 실행마다
+ * "새 모델 13종 편입"이 뜨는데(실측 2026-09-22), 사용자는 목록을 준 적이 없으므로
+ * 그 말은 사실이 아니다.
+ *
+ * @param {{ removed: string[], appended: string[], mode?: 'auto'|'user'|'fallback', pool?: string[] }} r
+ *   mode가 없으면 사용자 모드로 본다 (기존 호출부 호환)
  * @returns {string[]}
  */
 export function reconcileMessages(r) {
   /** @type {string[]} */
   const lines = [];
+
+  if (r.mode === 'auto') {
+    const pool = r.pool ?? [];
+    lines.push(
+      `i 모델 자동 모드 — 조회된 ${pool.length}종을 신형 우선으로 세웠다 (첫 모델: ${pool[0]})`,
+    );
+    lines.push('  (고정하려면 --models 또는 run 파일 MODELS 에 직접 적는다. 그 순서는 도구가 손대지 않는다)');
+    return lines;
+  }
+
+  if (r.mode === 'fallback') {
+    // 조회 실패 + 목록 없음. 근거 없이 한 종으로 가는 유일한 경로라 그 사실을 숨기지 않는다.
+    lines.push(`! 모델 목록을 조회하지 못해 폴백 1종으로 진행한다: ${(r.pool ?? [])[0]}`);
+    lines.push('  (이 모델이 이미 퇴역했다면 404로 끝난다 — 네트워크를 확인하거나 --models 로 직접 지정하라)');
+    return lines;
+  }
+
   for (const m of r.removed) {
     lines.push(`! ${m} 은(는) 더 이상 제공되지 않아 제외합니다`);
   }

@@ -7,10 +7,12 @@ import {
   filterModels,
   fetchAvailableModels,
   reconcilePool,
+  resolvePool,
   reconcileMessages,
   sortModelPool,
   parseModelVersion,
   stripPrefix,
+  FALLBACK_MODEL,
 } from '../src/models.js';
 
 const fixture = JSON.parse(
@@ -325,4 +327,127 @@ test('gemini-3-flash 는 gemini-3.6-flash 보다 뒤다 (3.0 < 3.6)', () => {
     'gemini-3.6-flash',
     'gemini-3-flash',
   ]);
+});
+
+// ── 자동 모드 (목록 미지정) ─────────────────────────────────────────
+//
+// 실측 2026-09-22: 외부 자동화 환경이 init 없이 직접 호출하는 경로가 기본값(단일 모델)로
+// 돌았다. 신형 우선 정렬은 init의 목록 생성에만 걸려 있어서, 그 경로는 정렬의 이득을
+// 받지 못한 채 API 목록 순서 그대로 붙은 꼬리를 밟았다 — 좀비 모델(404)이 먼저였다.
+
+const mixed = JSON.parse(
+  await readFile(new URL('../fixtures/models-list-mixed.json', import.meta.url), 'utf8'),
+);
+
+/** 픽스처를 조회 결과로 흉내 낸다 (필터를 거친 뒤의 모양). */
+const MIXED_AVAILABLE = filterModels(mixed);
+
+test('혼합 픽스처: 필터가 pro·embedding·tts를 걸러내고 조회 순서를 보존한다', () => {
+  assert.deepEqual(MIXED_AVAILABLE, [
+    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-flash-latest',
+    'gemini-flash-lite-latest',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.7-flash',
+    'gemini-3.8-flash',
+    'gemini-3.8-flash-preview',
+  ]);
+});
+
+test('목록 미지정 → 조회된 전체를 정렬해 쓴다 (자동 모드)', () => {
+  const r = resolvePool([], MIXED_AVAILABLE);
+  assert.equal(r.mode, 'auto');
+  assert.deepEqual(r.pool, sortModelPool(MIXED_AVAILABLE));
+  assert.equal(r.pool.length, MIXED_AVAILABLE.length, '조회된 것을 버리지 않는다');
+  // 자동 모드에는 사용자 목록이 없으므로 제외·편입이라는 사건 자체가 없다.
+  assert.deepEqual(r.removed, []);
+  assert.deepEqual(r.appended, []);
+});
+
+test('자동 모드의 첫 모델은 조회 목록 중 최신 stable full이다', () => {
+  // 3.8-preview(프리뷰)도 3.8-lite도 아니고, 구세대·별칭은 더더욱 아니다.
+  assert.equal(resolvePool([], MIXED_AVAILABLE).pool[0], 'gemini-3.8-flash');
+});
+
+test('자동 모드에서도 별칭은 꼬리다 (산출물에서 실체를 복원할 수 없다)', () => {
+  const pool = resolvePool([], MIXED_AVAILABLE).pool;
+  assert.deepEqual(pool.slice(-2), ['gemini-flash-latest', 'gemini-flash-lite-latest']);
+});
+
+test('목록을 명시하면 그 순서는 불변이다 (자동 모드로 빨려 들어가지 않는다)', () => {
+  // 사용자가 적어 둔 순서가 검증 게이트다. 도구가 "더 좋은 순서"를 알고 있어도 손대지 않는다.
+  const r = resolvePool(['gemini-2.0-flash', 'gemini-3.6-flash'], MIXED_AVAILABLE);
+  assert.equal(r.mode, 'user');
+  assert.deepEqual(r.pool.slice(0, 2), ['gemini-2.0-flash', 'gemini-3.6-flash']);
+});
+
+test('명시 목록의 꼬리에 붙는 편입분은 같은 규칙으로 정렬된다', () => {
+  // 실측 2026-09-22: 편입 13종이 API 순서 그대로 붙어 구세대·별칭이 앞이었고,
+  // 앞쪽 모델이 503으로 교체됐을 때 순환이 좀비 모델부터 밟았다.
+  const r = resolvePool(['gemini-3.6-flash'], MIXED_AVAILABLE);
+  assert.deepEqual(r.pool[0], 'gemini-3.6-flash', '사용자 모델이 여전히 맨 앞');
+  assert.equal(r.appended[0], 'gemini-3.8-flash', '꼬리의 첫째는 최신 stable full');
+  assert.deepEqual(r.appended.slice(-2), ['gemini-flash-latest', 'gemini-flash-lite-latest']);
+  // 편입분은 정렬 함수를 **공유**한다 — 규칙이 두 곳에 갈라지면 반드시 어긋난다.
+  assert.deepEqual(
+    r.appended,
+    sortModelPool(MIXED_AVAILABLE.filter((m) => m !== 'gemini-3.6-flash')),
+  );
+});
+
+test('조회 실패 + 목록 미지정 → 폴백 1종', () => {
+  const r = resolvePool([], null);
+  assert.equal(r.mode, 'fallback');
+  assert.deepEqual(r.pool, [FALLBACK_MODEL]);
+  assert.equal(r.pool.length, 1);
+});
+
+test('조회 결과가 빈 배열이어도 폴백으로 간다 (빈 풀로 실행하지 않는다)', () => {
+  const r = resolvePool([], []);
+  assert.equal(r.mode, 'fallback');
+  assert.deepEqual(r.pool, [FALLBACK_MODEL]);
+});
+
+test('조회 실패 + 목록 명시 → 사용자 목록 그대로 (대조 생략)', () => {
+  const r = resolvePool(['a-flash', 'b-flash'], null);
+  assert.equal(r.mode, 'user');
+  assert.deepEqual(r.pool, ['a-flash', 'b-flash']);
+});
+
+test('공백만 적힌 목록은 미지정으로 읽는다 (MODELS 줄을 지우다 공백이 남는다)', () => {
+  const r = resolvePool(['  ', ''], MIXED_AVAILABLE);
+  assert.equal(r.mode, 'auto');
+});
+
+test('폴백 모델명은 저장소 코드에 남는 유일한 모델명이다', () => {
+  // 이 이름도 언젠가 퇴역한다. 그때도 "아무것도 못 한다"가 아니라 한 번 시도하고
+  // 그 결과(404)를 보고하는 것이 폴백의 역할이다.
+  assert.equal(typeof FALLBACK_MODEL, 'string');
+  assert.ok(FALLBACK_MODEL.length > 0);
+});
+
+test('자동 모드 안내는 편입 문구를 쓰지 않는다 (사용자는 목록을 준 적이 없다)', () => {
+  const r = resolvePool([], MIXED_AVAILABLE);
+  const lines = reconcileMessages(r);
+  assert.ok(lines.some((l) => /자동 모드/.test(l)));
+  assert.ok(lines.some((l) => l.includes('gemini-3.8-flash')), '첫 모델을 밝힌다');
+  assert.ok(!lines.some((l) => /꼬리에 편입/.test(l)));
+  assert.ok(!lines.some((l) => /제공되지 않아 제외/.test(l)));
+});
+
+test('폴백 안내는 폴백이라는 사실을 숨기지 않는다', () => {
+  const lines = reconcileMessages(resolvePool([], null));
+  assert.ok(lines.some((l) => /폴백/.test(l)));
+  assert.ok(lines.some((l) => l.includes(FALLBACK_MODEL)));
+});
+
+test('명시 목록의 안내는 종전 그대로다 (제외·편입)', () => {
+  const r = resolvePool(['gone-flash', 'gemini-3.6-flash'], ['gemini-3.6-flash', 'new-flash']);
+  const lines = reconcileMessages(r);
+  assert.ok(lines.some((l) => /더 이상 제공되지 않아 제외/.test(l)));
+  assert.ok(lines.some((l) => /꼬리에 편입/.test(l)));
 });
