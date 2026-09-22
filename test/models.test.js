@@ -13,6 +13,7 @@ import {
   parseModelVersion,
   stripPrefix,
   FALLBACK_MODEL,
+  isAliasModel,
 } from '../src/models.js';
 
 const fixture = JSON.parse(
@@ -450,4 +451,42 @@ test('명시 목록의 안내는 종전 그대로다 (제외·편입)', () => {
   const lines = reconcileMessages(r);
   assert.ok(lines.some((l) => /더 이상 제공되지 않아 제외/.test(l)));
   assert.ok(lines.some((l) => /꼬리에 편입/.test(l)));
+});
+
+// ── 별칭 판정 (예산 계수에서 제외할 대상) ───────────────────────────
+
+test('실측에서 본 별칭 2종을 별칭으로 판정한다', () => {
+  assert.equal(isAliasModel('gemini-flash-latest'), true);
+  assert.equal(isAliasModel('gemini-flash-lite-latest'), true);
+});
+
+test('실체가 있는 모델은 별칭이 아니다', () => {
+  // 넓게 잡으면 실체가 있는 모델까지 예산에서 빠져, 이번에는 반대 방향으로 틀린 숫자가 된다.
+  for (const m of [
+    'gemini-3.6-flash',
+    'gemini-3.6-flash-lite',
+    'gemini-3.8-flash-preview',
+    'gemini-2.0-flash-001',
+    'gemini-omni-flash-preview',
+  ]) {
+    assert.equal(isAliasModel(m), false, m);
+  }
+});
+
+test('별칭 판정은 접미사로만 한다 (중간에 latest가 있어도 실체일 수 있다)', () => {
+  assert.equal(isAliasModel('gemini-latest-flash'), false);
+  assert.equal(isAliasModel('LATEST'), false, '하이픈 없는 이름은 접미사가 아니다');
+  assert.equal(isAliasModel('gemini-flash-LATEST'), true, '대소문자는 무시한다');
+});
+
+test('망가진 입력에도 던지지 않는다', () => {
+  assert.equal(isAliasModel(/** @type {any} */ (null)), false);
+  assert.equal(isAliasModel(''), false);
+});
+
+test('정렬에서 별칭이 꼬리인 것과 예산 계수 제외는 별개의 장치다', () => {
+  // 정렬은 "버전을 못 뽑는 이름"을 전부 뒤로 보내고(비별칭도 포함), 예산 제외는
+  // `-latest` 만 본다. 겹치지만 같지 않다 — 한쪽 규칙으로 다른 쪽을 대신하면 어긋난다.
+  assert.equal(parseModelVersion('gemini-omni-flash-preview'), null, '정렬에서는 꼬리');
+  assert.equal(isAliasModel('gemini-omni-flash-preview'), false, '예산에서는 센다');
 });
