@@ -80,19 +80,26 @@ export function hasUpdateCheckCall(text) {
  * ## 왜 CRLF인가
  * cmd 파서는 LF 단독 개행에서 라벨·블록 처리가 불안정하다. .bat은 CRLF가 정본이다.
  *
- * @param {{ chunk: number, models: string[] }} p
+ * @param {{ chunk: number, models?: string[] }} p
+ *   models를 주지 않으면 빈 MODELS(자동 모드)로 만든다 — init의 기본값이다
  * @returns {string} CRLF로 끝나는 ASCII 문자열
  */
-export function buildRunBat({ chunk, models }) {
+export function buildRunBat({ chunk, models = [] }) {
   const lines = [
     '@echo off',
     'rem ===== settings (edit here) =====',
     `set CHUNK=${chunk}`,
     `set MODELS=${models.join(',')}`,
     'rem ================================',
-    'rem MODELS is a priority list. The first model is used first.',
-    'rem Models appended by auto-discovery sit at the tail because they are',
-    'rem not verified for small-text reading. Promote one by moving it left.',
+    'rem MODELS is EMPTY on purpose: auto mode. On every run the tool asks the',
+    'rem API which models exist and puts the newest stable full model first,',
+    'rem so a new generation is picked up without editing this file.',
+    'rem',
+    'rem Fill it in only to PIN a fixed list, comma separated:',
+    'rem     set MODELS=model-a,model-b',
+    'rem A pinned list is used exactly in the order you write it. The tool never',
+    'rem reorders it - that order is your own verification gate. Models found at',
+    'rem run time are appended to the tail, never in front of yours.',
     '',
     'rem Parenthesized if-blocks in .bat break on any ) inside echoed text,',
     'rem so this uses a goto instead.',
@@ -119,8 +126,14 @@ export function buildRunBat({ chunk, models }) {
     '',
     ':run',
     ...updateCheckLines('bat'),
+    'rem An empty MODELS means auto mode, so the flag is left out entirely.',
+    'rem Passing a bare "--models" with nothing after it is an argument error in',
+    'rem most CLIs, and cmd expands an empty %MODELS% to nothing at all.',
+    'set MODELSOPT=',
+    'if not "%MODELS%"=="" set MODELSOPT=--models %MODELS%',
+    '',
     'rem %~dp0 is this file folder, so the whole folder can be moved freely.',
-    `call npx ${PKG} --file "%~dp0${LINKS_NAME}" -o "%~dp0out" --chunk %CHUNK% --models %MODELS%`,
+    `call npx ${PKG} --file "%~dp0${LINKS_NAME}" -o "%~dp0out" --chunk %CHUNK% %MODELSOPT%`,
     '',
     'rem npx is npx.cmd. Without "call" above, this .bat would end there and',
     'rem never reach the pause below, so the window would vanish.',
@@ -153,18 +166,23 @@ function assertAscii(text) {
 
 /**
  * run.sh 본문. UTF-8(BOM 없음) + LF. 여기는 한글 주석을 써도 안전하다.
- * @param {{ chunk: number, models: string[] }} p
+ * @param {{ chunk: number, models?: string[] }} p
+ *   models를 주지 않으면 빈 MODELS(자동 모드)로 만든다 — init의 기본값이다
  */
-export function buildRunSh({ chunk, models }) {
+export function buildRunSh({ chunk, models = [] }) {
   return [
     '#!/usr/bin/env bash',
     '# ===== 설정 (여기만 고치면 된다) =====',
     `CHUNK=${chunk}`,
     `MODELS="${models.join(',')}"`,
     '# ====================================',
-    '# MODELS는 우선순위 목록이다. 앞에 있는 모델이 먼저 쓰인다.',
-    '# 자동 발견으로 편입된 모델은 작은 글자 판독력이 미검증이라 꼬리에 있다.',
-    '# 써 보고 좋았으면 이름을 왼쪽으로 옮겨 승격하면 된다.',
+    '# MODELS는 비어 있는 것이 기본이다 (자동 모드).',
+    '# 실행할 때마다 가용 모델을 조회해 신형 stable을 맨 앞에 세우므로,',
+    '# 새 세대가 나와도 이 파일을 고치지 않아도 된다.',
+    '#',
+    '# 고정하고 싶을 때만 적는다 — 쉼표로 구분:   MODELS="model-a,model-b"',
+    '# 적어 둔 순서는 도구가 재정렬하지 않는다. 그 순서가 당신의 검증 게이트다.',
+    '# 실행 중 새로 발견된 모델은 당신 목록 **뒤에만** 붙는다.',
     '',
     'set -u',
     '',
@@ -186,6 +204,9 @@ export function buildRunSh({ chunk, models }) {
     'fi',
     '',
     ...updateCheckLines('sh'),
+    '# MODELS가 비어 있으면 빈 문자열이 그대로 넘어가고, 도구는 그것을 "지정 없음"',
+    '# = 자동 모드로 읽는다. 따옴표를 빼면 값이 통째로 사라져 --models 가 다음 인자를',
+    '# 삼키므로, 여기서 따옴표는 장식이 아니다.',
     `npx ${PKG} --file "$DIR/${LINKS_NAME}" -o "$DIR/out" --chunk "$CHUNK" --models "$MODELS"`,
     '',
     'echo',
@@ -221,7 +242,12 @@ export function buildLinksTxt() {
     '# ── 청크·모델 바꾸기 ────────────────────────────────────',
     '#   run.bat / run.sh 맨 위의 CHUNK, MODELS 값을 고친다.',
     '#   CHUNK 를 키우면 요청 수가 줄어든다 (기본 480초).',
-    '#   MODELS 는 우선순위 목록이다. 앞에 있는 모델이 먼저 쓰인다.',
+    '#',
+    '#   MODELS 는 비어 있는 것이 기본이다 (자동 모드).',
+    '#   실행할 때마다 쓸 수 있는 모델을 조회해 신형을 맨 앞에 세우므로,',
+    '#   새 세대가 나와도 이 파일들을 고치지 않아도 된다.',
+    '#   특정 모델로 고정하고 싶을 때만 쉼표로 구분해 적는다.',
+    '#   적어 둔 순서는 도구가 재정렬하지 않는다 — 그 순서가 당신의 검증 게이트다.',
     '#',
     '# ── 알아 둘 것 ──────────────────────────────────────────',
     '#   공개 영상만 처리된다 (회원 전용·비공개는 건너뛴다).',
@@ -247,7 +273,12 @@ export function buildLinksTxt() {
  * 갈아 끼울 때 같이 깨지므로, 파일을 읽는 것은 bin이 하고 여기는 내용만 받는다
  * (package.json 버전을 bin이 읽어 넘기는 것과 같은 경계).
  *
- * @param {{ cwd: string, models: string[], chunk: number, updateCheck?: string }} p
+ * `models`의 기본값이 빈 배열인 것이 이 명령의 계약이다 — 생성되는 run 파일은 MODELS를
+ * 비워 둔 자동 모드다. 초기값을 박아 두면 몇 달 뒤 생성된 run 파일이 존재하지 않는 모델을
+ * 가리키고(모델 세대교체가 빠르다), 그 상태를 사용자가 알아채는 시점은 첫 404다.
+ * 고정 목록을 원하는 사용자는 run 파일에 직접 적거나 `init --refresh-models`를 부른다.
+ *
+ * @param {{ cwd: string, models?: string[], chunk: number, updateCheck?: string }} p
  * @returns {Promise<{
  *   dir: string,
  *   created: string[],
@@ -255,7 +286,7 @@ export function buildLinksTxt() {
  *   chmodOk: boolean
  * }>}
  */
-export async function initRunDir({ cwd, models, chunk, updateCheck }) {
+export async function initRunDir({ cwd, models = [], chunk, updateCheck }) {
   const dir = join(cwd, RUN_DIR_NAME);
   await mkdir(dir, { recursive: true });
 

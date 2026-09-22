@@ -36,7 +36,7 @@ import {
 import { mergeVideo } from '../src/merge.js';
 import {
   fetchAvailableModels,
-  reconcilePool,
+  resolvePool,
   reconcileMessages,
   sortModelPool,
 } from '../src/models.js';
@@ -111,8 +111,16 @@ async function readScoutVersion() {
   }
 }
 
-/** 기본 모델. 단일이다 — 모델을 늘리는 것은 쿼터를 늘리는 선택이라 사용자가 정한다. */
-const DEFAULT_MODELS = 'gemini-3.6-flash';
+/**
+ * `--models` 기본값은 **빈 문자열**이다 = 자동 모드.
+ *
+ * 예전에는 여기에 모델 이름 하나가 박혀 있었다. 그 결과 `init` 없이 직접 호출하는 경로가
+ * 언제나 그 한 종으로만 돌았고, `init`에만 적용되던 신형 우선 정렬의 이득을 받지 못했다
+ * (실측 2026-09-22). 이름을 지우면 목록 결정이 조회 결과로 넘어가고, 새 세대가 나오면
+ * 다음 실행부터 자동으로 앞에 선다. 코드에 남는 유일한 모델명은 조회 실패용 폴백뿐이고
+ * 그것은 src/models.js의 FALLBACK_MODEL이다.
+ */
+const AUTO_MODELS = '';
 
 const USAGE = `
 youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰병
@@ -130,7 +138,10 @@ youtube-scout — 유튜브 영상에서 화면 정보까지 회수하는 정찰
   -f, --file   <path>   링크 목록 파일
   -o, --out    <dir>    산출물 디렉터리 (기본 ./out)
       --chunk  <sec>    청크 길이 (기본 ${DEFAULT_CHUNK_SEC})
-      --models <a,b,c>  사용할 모델 (기본 ${DEFAULT_MODELS}). 쿼터는 모델별로 분리돼 있다
+      --models <a,b,c>  사용할 모델을 고정한다. 적지 않으면 자동 —
+                        가용 모델을 조회해 신형 우선으로 세우고 그 첫 모델부터 쓴다.
+                        적어 두면 그 순서를 도구가 재정렬하지 않는다
+                        (쿼터는 모델별로 분리돼 있어 목록이 길수록 한도가 늘어난다)
   -y, --yes             한도 초과 확인을 생략
       --harness <path>  하네스 교체 (산출물 frontmatter에 각인된다)
   -h, --help            이 도움말
@@ -421,30 +432,20 @@ async function confirm(question) {
  * 키 등록 안내가 생성물 안에 들어 있는 것이 이 기능의 핵심이다. 그래서 키 검사보다 앞에서
  * 처리한다.
  *
- * @param {{ chunk: number, fallbackModels: string[] }} p
+ * ## 왜 여기서 모델 목록을 조회하지 않는가 (2026-09-22)
+ * 예전에는 init이 가용 모델을 조회해 run 파일의 MODELS에 박아 넣었다. 이제 run 파일은
+ * MODELS를 비운 자동 모드로 만들어지고, 목록은 **실행할 때마다** 정해진다. 그래서 여기서
+ * 조회해 봐야 쓸 곳이 없다 — 결과를 화면에만 보여 주면 "지금이라면 이 모델"이라는 말이
+ * 되는데, 그 값은 다음 실행이 어차피 다시 정한다. 실물과 다를 수 있는 숫자를 보고로
+ * 내놓지 않는다. 덕분에 init은 네트워크 없이도 즉시 끝난다.
+ *
+ * @param {{ chunk: number }} p
  */
 async function runInit(p) {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  // MODELS 초기값을 하드코딩하지 않는다. 모델 세대교체가 빨라서, 박아 두면
-  // 몇 달 뒤 생성된 run 파일이 존재하지 않는 모델을 가리킨다.
-  let models = p.fallbackModels;
-  let discovered = false;
-
-  if (apiKey) {
-    show('가용 모델 조회 중...');
-    const available = await fetchAvailableModels(apiKey);
-    if (available) {
-      // API 응답 순서(대체로 구세대가 앞)를 그대로 쓰면 실행이 죽은 구간을 먼저 들이받는다.
-      // 정렬은 목록을 **만들 때만** 한다 — 사용자가 승격해 둔 순서는 이후 건드리지 않는다.
-      models = sortModelPool(available);
-      discovered = true;
-    }
-  }
-
+  // models를 넘기지 않는다 = 빈 MODELS(자동 모드). 초기값을 박아 두면 몇 달 뒤 생성된
+  // run 파일이 존재하지 않는 모델을 가리키고, 사용자가 그것을 아는 시점은 첫 404다.
   const r = await initRunDir({
     cwd: process.cwd(),
-    models,
     chunk: p.chunk,
     updateCheck: await readUpdateCheckSource(),
   });
@@ -455,22 +456,11 @@ async function runInit(p) {
   for (const name of r.skipped) show(`  = ${name} (이미 있어서 건드리지 않았다)`);
 
   show('');
-  if (discovered) {
-    show(`  모델 ${models.length}개를 지금 조회해 넣었다: ${models.join(', ')}`);
-    show('  앞에 있는 모델이 먼저 쓰인다. 순서는 run 파일 상단에서 바꿀 수 있다.');
-    show('  (신형 세대를 앞에, -latest 별칭을 뒤에 뒀다 — 구세대는 실제로 죽어 있는 경우가');
-    show('   많고, 별칭은 산출물에서 어느 모델이었는지 복원할 수 없다)');
-  } else {
-    show(`  모델은 기본값 하나로 넣었다: ${models.join(', ')}`);
-    if (apiKey) {
-      show('  (모델 목록 조회에 실패했다. 네트워크가 되는 곳에서');
-      show('   youtube-scout init --refresh-models 를 실행하면 그때 가용한 모델로 채워진다)');
-    } else {
-      show('  (GEMINI_API_KEY가 없어 조회를 건너뛰었다. 키를 등록한 뒤');
-      show('   youtube-scout init --refresh-models 를 실행하면 MODELS 줄만 갱신된다 —');
-      show('   링크와 CHUNK 설정은 그대로 유지된다)');
-    }
-  }
+  show('  모델은 지정하지 않았다 (MODELS 비어 있음 = 자동).');
+  show('  실행할 때마다 가용 모델을 조회해 신형 stable을 맨 앞에 세운다 —');
+  show('  새 세대가 나와도 run 파일을 고치지 않아도 된다.');
+  show('  특정 모델로 고정하려면 run 파일 상단 MODELS 에 쉼표로 구분해 적는다.');
+  show('  (적어 둔 순서는 도구가 재정렬하지 않는다 — 그 순서가 검증 게이트다)');
 
   if (r.created.includes(UPDATE_CHECK_NAME)) {
     show('');
@@ -815,15 +805,26 @@ async function runVideo(p) {
 
 // ── 진입점 ──────────────────────────────────────────────────────────
 async function main() {
+  // 값 없이 꼬리에 붙은 `--models` 는 "지정하지 않음"(자동 모드)으로 읽는다.
+  //
+  // 이 판 이전에 만들어진 run.bat에는 `--models %MODELS%` 가 무조건 박혀 있다. 자동 모드로
+  // 바꾸려고 MODELS 줄을 비우면 cmd가 `%MODELS%` 를 아무것도 아닌 것으로 펼쳐, 인자가
+  // `--models` 하나만 남은 채 넘어온다. parseArgs는 여기서 던지고, 사용자는 안내대로 했을
+  // 뿐인데 "인자 오류"를 본다. 빈 값과 미지정은 이 도구에서 같은 뜻이므로 그렇게 읽어 준다.
+  // (이 판부터 생성되는 run.bat은 아예 플래그를 빼므로 이 경로를 타지 않는다)
+  const argv = process.argv.slice(2);
+  if (argv.at(-1) === '--models') argv.pop();
+
   let parsed;
   try {
     parsed = parseArgs({
+      args: argv,
       allowPositionals: true,
       options: {
         file: { type: 'string', short: 'f' },
         out: { type: 'string', short: 'o', default: './out' },
         chunk: { type: 'string', default: String(DEFAULT_CHUNK_SEC) },
-        models: { type: 'string', default: DEFAULT_MODELS },
+        models: { type: 'string', default: AUTO_MODELS },
         yes: { type: 'boolean', short: 'y', default: false },
         harness: { type: 'string' },
         // init 전용. 기존 실행 환경의 MODELS 줄만 갈아 끼운다 (사용자가 명시적으로 부를 때만)
@@ -865,7 +866,7 @@ async function main() {
     // 갱신은 사용자가 명시적으로 부를 때만 MODELS 줄 하나를 바꾼다.
     if (values['refresh-models']) return runRefreshModels();
     if (values['refresh-update-check']) return runRefreshUpdateCheck();
-    return runInit({ chunk, fallbackModels: String(values.models).split(',').map((m) => m.trim()).filter(Boolean) });
+    return runInit({ chunk });
   }
 
   for (const flag of ['refresh-models', 'refresh-update-check']) {
@@ -954,7 +955,12 @@ async function main() {
   // 부팅 진행과 **병렬로** 돌린다. 3초짜리 조회를 순차로 붙이면 매 실행이 그만큼 느려진다.
   const updateHint = checkForUpdate();
 
-  const requestedModels = String(values.models).split(',');
+  // 비어 있으면 자동 모드다. 공백만 적힌 경우(`--models " "`)도 같은 뜻으로 읽는다 —
+  // run 파일에서 MODELS 값을 지웠는데 공백이 남는 일이 흔하다.
+  const requestedModels = String(values.models)
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
 
   // 부팅 단계 표시. 끝난 단계가 한 줄씩 쌓인다.
   const boot = makeBootSteps();
@@ -990,7 +996,9 @@ async function main() {
   const available = await fetchAvailableModels(apiKey);
   // 조회 실패도 끝난 단계다. 몇 종을 봤는지(또는 못 봤는지)가 뒤의 대조 결과를 설명한다.
   boot.finish(`모델 목록 조회 (${available ? `${available.length}종` : '건너뜀'})`);
-  const reconciled = reconcilePool(requestedModels, available);
+  // 목록을 지정했으면 그 순서 그대로(대조만), 지정하지 않았으면 조회 결과 전체를
+  // 신형 우선으로 세운다. 조회까지 실패하면 그때만 폴백 1종이다.
+  const reconciled = resolvePool(requestedModels, available);
   for (const line of reconcileMessages(reconciled)) log(line);
 
   // 3-6) 상태 반영: blocked는 제외, demoted는 순환 꼬리로. 대조 **뒤**에 적용한다 —

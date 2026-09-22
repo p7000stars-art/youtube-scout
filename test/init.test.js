@@ -514,3 +514,101 @@ test('hasUpdateCheckCall은 파일명으로 판정한다 (조건문을 손봤어
   assert.equal(hasUpdateCheckCall('node "x/update-check.js"'), true);
   assert.equal(hasUpdateCheckCall('call npx foo'), false);
 });
+
+// ── MODELS 초기값 = 비어 있음 (자동 모드) ───────────────────────────
+//
+// 실측 2026-09-22: 모델 초기값을 파일에 박아 두면 그 파일은 만들어진 날의 목록에 고정된다.
+// 세대교체가 빨라서 몇 달 뒤에는 존재하지 않는 모델을 가리키고, 사용자가 그것을 아는
+// 시점은 첫 404다. 비워 두면 실행할 때마다 목록이 정해지고 새 세대가 저절로 앞에 선다.
+
+test('models를 주지 않으면 run.bat의 MODELS가 비어 있다 (init의 기본값)', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, chunk: 480 });
+  const bat = await readFile(join(r.dir, RUN_BAT_NAME), 'utf8');
+  assert.match(bat, /^set MODELS=$/m, 'MODELS 줄은 있고 값만 비어 있다');
+});
+
+test('models를 주지 않으면 run.sh의 MODELS도 비어 있다', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, chunk: 480 });
+  const sh = await readFile(join(r.dir, RUN_SH_NAME), 'utf8');
+  assert.match(sh, /^MODELS=""$/m);
+});
+
+test('빈 MODELS로 만든 run.bat도 ASCII 전용 + CRLF다 (인코딩 계약은 그대로다)', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, chunk: 480 });
+  const buf = await readFile(join(r.dir, RUN_BAT_NAME));
+  assert.equal(buf.some((b) => b > 0x7f), false, 'non-ASCII 바이트 0');
+  assert.ok(buf.includes(Buffer.from('\r\n')), 'CRLF');
+  assert.equal(/[^\r]\n/.test(buf.toString('utf8')), false, 'LF 단독 개행 없음');
+});
+
+test('빈 MODELS면 run.bat이 --models 플래그를 아예 넘기지 않는다', () => {
+  // 값 없는 `--models` 는 대부분의 CLI에서 인자 오류다. cmd는 빈 %MODELS%를
+  // 아무것도 아닌 것으로 펼치므로, 플래그 자체를 조건부로 만든다.
+  const bat = buildRunBat({ chunk: 480 });
+  assert.match(bat, /^set MODELSOPT=$/m);
+  assert.match(bat, /^if not "%MODELS%"=="" set MODELSOPT=--models %MODELS%$/m);
+  assert.match(bat, /call npx .* --chunk %CHUNK% %MODELSOPT%/);
+  assert.equal(/--chunk %CHUNK% --models/.test(bat), false, '플래그를 직접 박지 않는다');
+});
+
+test('run.sh는 빈 문자열을 그대로 넘긴다 (도구가 미지정으로 읽는다)', () => {
+  const sh = buildRunSh({ chunk: 480 });
+  // 따옴표가 빠지면 값이 통째로 사라져 --models 가 다음 인자를 삼킨다.
+  assert.match(sh, /--models "\$MODELS"/);
+});
+
+test('고정 목록을 주면 종전처럼 그대로 박힌다 (--refresh-models 사용자용 경로)', () => {
+  const bat = buildRunBat({ chunk: 480, models: MODELS });
+  const sh = buildRunSh({ chunk: 480, models: MODELS });
+  assert.match(bat, /^set MODELS=gemini-3\.6-flash,gemini-3\.6-flash-lite$/m);
+  assert.match(sh, /^MODELS="gemini-3\.6-flash,gemini-3\.6-flash-lite"$/m);
+});
+
+test('run 파일 주석이 자동 모드와 고정 방법을 둘 다 설명한다', () => {
+  const bat = buildRunBat({ chunk: 480 });
+  assert.match(bat, /auto mode/i);
+  assert.match(bat, /PIN a fixed list/i);
+  const sh = buildRunSh({ chunk: 480 });
+  assert.match(sh, /자동 모드/);
+  assert.match(sh, /고정하고 싶을 때만/);
+});
+
+test('links.txt 안내도 자동 모드를 설명한다 (한국어 안내는 여기가 진다)', async () => {
+  const cwd = await makeCwd();
+  const r = await initRunDir({ cwd, chunk: 480 });
+  const text = await readFile(join(r.dir, LINKS_NAME), 'utf8');
+  assert.match(text, /자동 모드/);
+  assert.match(text, /고정하고 싶을 때만/);
+});
+
+test('빈 MODELS로 만든 뒤 --refresh-models 로 고정 목록을 채울 수 있다', async () => {
+  // 자동 모드가 기본이 돼도, 고정하고 싶은 사용자의 경로가 끊기면 안 된다.
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, chunk: 480 });
+  const r = await refreshRunModels({ cwd, models: ['gemini-9.9-flash', 'gemini-9.8-flash'] });
+
+  assert.deepEqual(r.updated.map((u) => u.name).sort(), [RUN_BAT_NAME, RUN_SH_NAME].sort());
+  assert.equal(r.updated[0].before, '', '전 상태는 빈 목록이다');
+  const bat = await readFile(join(r0.dir, RUN_BAT_NAME), 'utf8');
+  assert.match(bat, /^set MODELS=gemini-9\.9-flash,gemini-9\.8-flash$/m);
+  // 채워 넣은 뒤에는 조건문이 플래그를 살려 준다
+  assert.match(bat, /^if not "%MODELS%"=="" set MODELSOPT=--models %MODELS%$/m);
+});
+
+test('init을 다시 불러도 사용자가 채운 MODELS를 덮어쓰지 않는다', async () => {
+  const cwd = await makeCwd();
+  const r0 = await initRunDir({ cwd, chunk: 480 });
+  const batPath = join(r0.dir, RUN_BAT_NAME);
+  const pinned = (await readFile(batPath, 'utf8')).replace(
+    /^set MODELS=$/m,
+    'set MODELS=my-pinned-flash',
+  );
+  await writeFile(batPath, pinned, 'utf8');
+
+  const r1 = await initRunDir({ cwd, chunk: 480 });
+  assert.ok(r1.skipped.includes(RUN_BAT_NAME));
+  assert.match(await readFile(batPath, 'utf8'), /^set MODELS=my-pinned-flash$/m);
+});

@@ -1,0 +1,98 @@
+{
+  "_comment": "회귀 픽스처 — 자동 모드(목록 미지정) 검증용. 삭제 금지. 2026-09-22 실측에서 조회된 목록의 성격을 재현한다: 구세대가 앞, 별칭이 중간, 최신 세대가 뒤. 이 순서를 그대로 쓰면 실행이 죽은 구간부터 밟는다는 것이 정렬의 근거다. 필터가 계속 도는지 보려고 pro·embedding·tts도 섞어 뒀다.",
+  "models": [
+    {
+      "name": "models/gemini-2.0-flash",
+      "version": "2.0",
+      "displayName": "Gemini 2.0 Flash",
+      "description": "구세대. 실측에서 자정 리셋 직후에도 즉시 일일 한도였다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-2.5-flash",
+      "version": "2.5",
+      "displayName": "Gemini 2.5 Flash",
+      "description": "목록에는 있으나 generateContent가 404인 퇴역(좀비) 모델로 실측됐다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-2.5-flash-lite",
+      "version": "2.5",
+      "displayName": "Gemini 2.5 Flash-Lite",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-flash-latest",
+      "version": "Gemini Flash Latest",
+      "displayName": "Gemini Flash Latest",
+      "description": "별칭. version 필드가 자기 이름을 반복할 뿐이라 실체를 복원할 수 없다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-flash-lite-latest",
+      "version": "Gemini Flash-Lite Latest",
+      "displayName": "Gemini Flash-Lite Latest",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.5-flash",
+      "version": "3.5",
+      "displayName": "Gemini 3.5 Flash",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.5-flash-lite",
+      "version": "3.5",
+      "displayName": "Gemini 3.5 Flash-Lite",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.6-flash",
+      "version": "3.6-flash-07-2026",
+      "displayName": "Gemini 3.6 Flash",
+      "description": "실측에서 완주 실적이 있는 모델. version 필드가 실체를 밝힌다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens", "streamGenerateContent"]
+    },
+    {
+      "name": "models/gemini-3.7-flash",
+      "version": "3.7",
+      "displayName": "Gemini 3.7 Flash",
+      "description": "미사용. 판독력 미검증이다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.8-flash",
+      "version": "3.8",
+      "displayName": "Gemini 3.8 Flash",
+      "description": "이 목록에서 가장 새로운 stable full. 자동 모드의 첫 모델이 되어야 한다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.8-flash-preview",
+      "version": "3.8",
+      "displayName": "Gemini 3.8 Flash Preview",
+      "description": "프리뷰일수록 쿼터가 조여 있다 — 같은 세대 stable보다 뒤여야 한다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/gemini-3.8-pro",
+      "version": "3.8",
+      "displayName": "Gemini 3.8 Pro",
+      "description": "유료 전용. 무료 키로는 첫 호출부터 막힌다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/text-embedding-005",
+      "version": "005",
+      "displayName": "Text Embedding 005",
+      "supportedGenerationMethods": ["embedContent"]
+    },
+    {
+      "name": "models/gemini-3.8-flash-tts",
+      "version": "3.8",
+      "displayName": "Gemini 3.8 Flash TTS",
+      "description": "flash + generateContent 이지만 용도가 음성 합성이다.",
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    }
+  ]
+}
