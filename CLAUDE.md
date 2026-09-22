@@ -99,7 +99,7 @@ youtube-scout/
 │  ├─ ui.test.js                # 폭 계산·막대·색·배너 안전망
 │  ├─ log-queue.test.js         # 쓰기 순서 보장 + 실패해도 큐가 죽지 않음
 │  ├─ exit.test.js              # 종료 코드 설정 + unref 안전망
-│  ├─ cli-exit.test.js          # 진입점이 process.exit를 직접 부르지 않는지
+│  ├─ cli-exit.test.js          # 진입점을 실제로 실행해 깨끗이 끝나는지 (크래시 경로 회귀)
 │  ├─ update-check.test.js      # 캐시 항목 판별·시각 비교·삭제 재확인
 │  └─ bump-version.test.js      # version 줄 하나만 바뀌는지
 ├─ scripts/
@@ -818,7 +818,7 @@ https://www.youtube.com/watch?v=UUFDMG1wpcY
 ### 19-5. `bin/exit.js` — 종료 절차
 - `finishProcess(code)`: **종료 코드를 설정만 하고** 이벤트 루프가 자연히 비도록 둔다. `unref`한 3초 안전망(`EXIT_GUARD_MS`)을 함께 걸어 루프가 끝내 비지 않는 예외 상황에서만 끊는다
 - **`process.exit()`를 직접 부르지 않는다**: fetch(undici)의 소켓·타이머가 정리되는 **도중에** 끊으면 Windows에서 libuv가 abort한다(`UV_HANDLE_CLOSING`, 0xC0000409 — 실측 2026-07-31·08-01, 100% 재현). 리눅스에서는 재현되지 않아 ubuntu 전용 CI가 그대로 통과시켰다 — CI에 windows가 들어간 이유가 이 결함이다
-- 비용은 0에 가깝다(리눅스 측정: 응답 후 루프가 비기까지 25~50ms). `test/cli-exit.test.js`가 진입점에 직접 호출이 다시 들어오지 못하게 지킨다
+- 비용은 0에 가깝다(리눅스 측정: 응답 후 루프가 비기까지 25~50ms). 지키는 방식은 둘이다 — `test/exit.test.js`가 절차 자체(코드 설정만·`unref`·발동 시에만 끊음)를, `test/cli-exit.test.js`가 **진입점을 실제로 실행해** 크래시가 났던 경로들(`init`, `init --refresh-models`, `--refresh-update-check`, 키 없음)이 깨끗이 끝나는지를 본다
 
 ### 19-6. `bin/log-queue.js` — `_batch.log` 쓰기 큐
 - `createLogWriter()` → `{ setPath, write, flush }`. `write()`는 **즉시 반환**하고 순서만 보장한다(로그 쓰기가 추출을 붙잡으면 우선순위가 뒤집힌다). 종료 직전 `flush()` 1회
@@ -872,7 +872,8 @@ https://www.youtube.com/watch?v=UUFDMG1wpcY
     `rpd` 기록은 날짜가 바뀌면 사라지고, `503`은 애초에 기록되지 않는다
 17. 최종본 frontmatter에 `harness_sha256`·`scout_version`·`temperature`가 들어 있고,
     하네스를 한 글자 고치면 해시가 바뀐다 (CRLF/LF 차이로는 바뀌지 않는다)
-18. 진입점이 `process.exit`를 직접 부르지 않는다 (`test/cli-exit.test.js`가 지킨다)
+18. 진입점이 `process.exit`를 직접 부르지 않고, 네트워크를 친 직후 끝나는 경로도 깨끗이 종료된다
+    (`test/exit.test.js` + `test/cli-exit.test.js`)
 19. 파이프·리다이렉트 출력에 ANSI 이스케이프·스피너 프레임이 섞이지 않는다
 20. 업데이트 확인이 **youtube-scout 항목만** 지우고, 지우지 못했으면 지웠다고 말하지 않는다
 
