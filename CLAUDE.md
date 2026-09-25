@@ -1,4 +1,5 @@
 # Youtube Scout — 구현 지시서 (CLAUDE.md)
+mywiki: youtube-scout, review-log, reusable-lessons  ← 실행자(Claude Code·Codex·Aside)는 이 페이지들 머리의 「지식 정리」(있을 때)를 먼저 읽는다 — 도구 선택·비용·권한 경계·미확보 조건. 로컬 실행일 때만(원격 컨테이너엔 vault 없음). 형식 정본: mywiki `project-ops-template.md` 2.4 (2026-09-25)
 
 > 이 문서는 자기완결이다. 외부 파일 참조 없이 이 문서만으로 전체를 구현한다.
 > 모든 설계 결정은 2026-07-30 실측과 6개 결정(D1~D6)으로 확정됐다. **재검토하지 마라.**
